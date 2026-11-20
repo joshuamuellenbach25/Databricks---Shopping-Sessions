@@ -1,0 +1,3 @@
+# A static Rust binary with hand-written parsing, not a query engine
+
+The score is wall-clock time on 8 vCPUs for an exact result, and the CSV dialect, timestamp grammar and session rules are small and exact. DuckDB, Polars and Spark readers each handle quoting, malformed lines or Unicode digits differently from rules.md (their own starter READMEs say so), and the leaderboard shows query-engine entries 5 to 20 times slower than the leaders. We write the parser, the dedup, the union-find and the session rules by hand in Rust, compile one static musl binary, and ship it in a `FROM scratch` image so container start costs nothing. Consequence: every rule has its own test, and a rule change is a code change, not a query change.
