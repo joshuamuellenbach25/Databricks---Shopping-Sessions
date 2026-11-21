@@ -13,7 +13,7 @@ pub struct Click {
     pub person: Key,
     pub id: Key,
     pub ts: i32,
-    pub campaign: u16,
+    pub campaign: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<Click>() == 24);

@@ -9,6 +9,7 @@ mod people;
 mod scan;
 mod sessions;
 mod timestamp;
+mod wide;
 
 use std::ffi::{c_int, c_long};
 use std::path::{Path, PathBuf};
@@ -74,16 +75,26 @@ fn run() -> Result<(), Fail> {
 
     let window = lookups::read_manifest(&data)?;
     let products = lookups::read_products(&data)?;
-    events::check_fits(window, &products)?;
     let campaigns = lookups::read_campaigns(&data)?;
     let user_dir = out.join("user_daily");
     let campaign_dir = out.join("campaign_daily");
-    std::fs::create_dir_all(&user_dir)?;
-    std::fs::create_dir_all(&campaign_dir)?;
+    table_dir(&user_dir)?;
+    table_dir(&campaign_dir)?;
     let link_pairs = links::collect(&scan::csv_files(&data.join("links"))?, threads)?;
     let event_files = scan::csv_files(&data.join("events"))?;
     let click_files = scan::csv_files(&data.join("clicks"))?;
     phase("lookups and links");
+
+    if !events::fits(window, &products) {
+        let expected = link_pairs.iter().map(Vec::len).sum();
+        let people = People::build(link_pairs.into_iter().flatten(), expected);
+        let tables = wide::run(&event_files, &click_files, threads, window, &products, &campaigns, &people)?;
+        output::write_user_daily(&user_dir.join("part-000.parquet"), &tables.rows, &products.categories)?;
+        output::write_campaign_daily(&campaign_dir.join("part-000.parquet"), &tables.accum, &campaigns, tables.base_day)?;
+        phase("wide records");
+        check_output(&out)?;
+        std::process::exit(0);
+    }
 
     let event_ctx = events::Context { window, products: &products };
     let (people, parsed) = std::thread::scope(|scope| {
@@ -173,6 +184,21 @@ fn count<T>(buckets: &[Vec<Vec<T>>]) -> usize {
     buckets.iter().flatten().map(Vec::len).sum()
 }
 
+fn table_dir(dir: &Path) -> Result<(), String> {
+    let fail = |e: std::io::Error| format!("{}: {e}", dir.display());
+    std::fs::create_dir_all(dir).map_err(fail)?;
+    for entry in std::fs::read_dir(dir).map_err(fail)? {
+        let entry = entry.map_err(fail)?;
+        let name = entry.file_name();
+        let name = name.as_encoded_bytes();
+        let table_file = name.ends_with(b".parquet") && !name.starts_with(b".") && !name.starts_with(b"_");
+        if table_file && entry.file_type().map_err(fail)?.is_file() {
+            std::fs::remove_file(entry.path()).map_err(|e| format!("{}: {e}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn check_output(out: &Path) -> Result<(), String> {
     for table in ["user_daily", "campaign_daily"] {
         let dir = out.join(table);
@@ -201,5 +227,24 @@ mod tests {
         assert_eq!(unsafe { mi_option_get(MI_OPTION_PURGE_DELAY) }, 1000);
         keep_freed_memory();
         assert_eq!(unsafe { mi_option_get(MI_OPTION_PURGE_DELAY) }, -1);
+    }
+
+    #[test]
+    fn table_dir_removes_only_the_parquet_files_a_reader_takes() {
+        let dir = std::env::temp_dir().join(format!("table-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fresh = dir.join("campaign_daily");
+        table_dir(&fresh).unwrap();
+        assert!(fresh.is_dir());
+        let table = dir.join("user_daily");
+        std::fs::create_dir_all(table.join("nested.parquet")).unwrap();
+        for name in ["part-000.parquet", "part-001.parquet", "_SUCCESS", ".part-0.parquet.crc", "_part-9.parquet", ".part-8.parquet", "notes.txt"] {
+            std::fs::write(table.join(name), b"stale").unwrap();
+        }
+        table_dir(&table).unwrap();
+        let mut left: Vec<String> = std::fs::read_dir(&table).unwrap().map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(left, [".part-0.parquet.crc", ".part-8.parquet", "_SUCCESS", "_part-9.parquet", "nested.parquet", "notes.txt"]);
     }
 }

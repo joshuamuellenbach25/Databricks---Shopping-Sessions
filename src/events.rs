@@ -70,9 +70,9 @@ impl Sale {
     pub const NONE: Sale = Sale(0);
 
     #[inline]
-    pub fn new(price: u32, cat: u16) -> Sale {
-        debug_assert!((1..=PRICE_MASK).contains(&price) && usize::from(cat) < MAX_CATEGORIES);
-        Sale(price | (u32::from(cat) << PRICE_BITS))
+    pub fn new(price: u32, cat: u32) -> Sale {
+        debug_assert!((1..=PRICE_MASK).contains(&price) && (cat as usize) < MAX_CATEGORIES);
+        Sale(price | (cat << PRICE_BITS))
     }
 
     #[inline]
@@ -86,45 +86,25 @@ impl Sale {
     }
 
     #[inline]
-    pub fn cat(self) -> u16 {
-        (self.0 >> PRICE_BITS) as u16
+    pub fn cat(self) -> u32 {
+        self.0 >> PRICE_BITS
     }
 }
 
 const _: () = assert!(std::mem::size_of::<Raw>() == 32);
 const _: () = assert!(std::mem::size_of::<Event>() == 16);
-// `recycle` reuses a raw buffer as an event buffer: the layouts must match.
 const _: () = assert!(std::mem::size_of::<Raw>() == 2 * std::mem::size_of::<Event>());
 const _: () = assert!(std::mem::align_of::<Raw>() == std::mem::align_of::<Event>());
 
-/// Turns a processed raw buffer into an empty event buffer over the same
-/// allocation, twice the capacity, so dedup writes its output into pages that
-/// parse already touched instead of faulting in new ones.
 fn recycle(mut raws: Vec<Raw>) -> Vec<Event> {
     raws.clear();
     let mut raws = std::mem::ManuallyDrop::new(raws);
     let capacity = raws.capacity();
-    // SAFETY: the allocation holds `capacity` Raws of 32 bytes at alignment 8,
-    // which is `2 * capacity` Events of 16 bytes at the same alignment (the
-    // asserts above), so the layout given back on drop is the one allocated.
-    // The length is 0 and both types are Copy, so nothing is read or dropped.
     unsafe { Vec::from_raw_parts(raws.as_mut_ptr().cast::<Event>(), 0, 2 * capacity) }
 }
 
-/// Refuses a dataset whose times or categories do not fit the records. Times
-/// are i32 milliseconds from the window start; clicks reach 7 days before the
-/// window and attribution adds 7 days to a click time, so the window's span
-/// plus 7 days must fit in i32.
-pub fn check_fits(window: Window, products: &Products) -> Result<(), String> {
-    let span = window.end.saturating_sub(window.start);
-    let most = i64::from(i32::MAX) - WEEK;
-    if span > most {
-        return Err(format!("manifest.json: the window spans {span} ms; times are stored as i32 milliseconds from window_start, which allows at most {most} ms"));
-    }
-    if products.categories.len() > MAX_CATEGORIES {
-        return Err(format!("products.csv: {} categories counting unknown; an event record holds at most {MAX_CATEGORIES}", products.categories.len()));
-    }
-    Ok(())
+pub fn fits(window: Window, products: &Products) -> bool {
+    window.end.saturating_sub(window.start) <= i64::from(i32::MAX) - WEEK && products.categories.len() <= MAX_CATEGORIES
 }
 
 pub struct Context<'a> {
@@ -211,18 +191,14 @@ pub fn parse(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Resul
     )
 }
 
-/// Dedups on event_id (smallest ingest wins, before validation), keeps the
-/// valid, not-late events and returns them bucketed by person. Each thread
-/// writes a person bucket's events into chunks sized from the raw count: no
-/// output vector is ever reallocated. A chunk reuses a raw buffer the thread
-/// has finished with when one is spare, else is allocated as dedup advances.
+const MAX_SPARE_CHUNKS: usize = 64;
+const MAX_RECYCLED_CHUNKS: usize = 8;
+
 pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> {
     /// Chunks each thread fills per person bucket when events spread evenly.
     const CHUNKS_PER_PART: usize = 8;
     /// Smallest chunk, in events.
     const MIN_CHUNK: usize = 64;
-    /// Most recycled raw buffers a thread holds for later chunks; the rest are freed.
-    const MAX_SPARE: usize = 64;
     let by_bucket: Vec<Mutex<Vec<Vec<Raw>>>> = (0..EVENT_BUCKETS).map(|_| Mutex::new(Vec::with_capacity(parsed.len()))).collect();
     let mut raw_total = 0;
     for state in parsed {
@@ -241,8 +217,8 @@ pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> 
                     let mut full: Vec<Vec<Vec<Event>>> = (0..PERSON_BUCKETS).map(|_| Vec::new()).collect();
                     let mut kept: HashMap<Key, (i64, u32, u32)> = HashMap::new();
                     let mut survivors: Vec<(u32, u32)> = Vec::new();
-                    // Processed raw buffers, recycled as output chunks.
-                    let mut spare: Vec<Vec<Event>> = Vec::with_capacity(MAX_SPARE);
+                    let mut spare: Vec<Vec<Event>> = Vec::new();
+                    let mut spare_slots = 0;
                     loop {
                         let b = next.fetch_add(1, Ordering::Relaxed);
                         if b >= EVENT_BUCKETS {
@@ -277,7 +253,13 @@ pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> 
                             let bucket = person.bucket(PERSON_BITS);
                             let current = &mut open[bucket];
                             if current.len() == current.capacity() {
-                                let fresh = spare.pop().unwrap_or_else(|| Vec::with_capacity(chunk));
+                                let fresh = match spare.pop() {
+                                    Some(buffer) => {
+                                        spare_slots -= buffer.capacity();
+                                        buffer
+                                    }
+                                    None => Vec::with_capacity(chunk),
+                                };
                                 let filled = std::mem::replace(current, fresh);
                                 if !filled.is_empty() {
                                     full[bucket].push(filled);
@@ -286,7 +268,9 @@ pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> 
                             current.push(Event { person, ts: raw.ts, sale: raw.sale });
                         }
                         for part in parts {
-                            if spare.len() < MAX_SPARE && 2 * part.capacity() >= chunk {
+                            let slots = 2 * part.capacity();
+                            if (chunk..=MAX_RECYCLED_CHUNKS * chunk).contains(&slots) && spare_slots + slots <= MAX_SPARE_CHUNKS * chunk {
+                                spare_slots += slots;
                                 spare.push(recycle(part));
                             }
                         }
@@ -346,8 +330,8 @@ mod tests {
         Products {
             map,
             categories: (0..categories).map(|i| format!("c{i}").into_bytes()).collect(),
-            unknown: (categories - 1) as u16,
-            rank: (0..categories as u16).collect(),
+            unknown: (categories - 1) as u32,
+            rank: (0..categories as u32).collect(),
         }
     }
 
@@ -363,7 +347,7 @@ mod tests {
 
     #[test]
     fn sale_holds_the_largest_price_and_category() {
-        for (price, cat) in [(1, 0), (250, 7), (10_000_000, (MAX_CATEGORIES - 1) as u16)] {
+        for (price, cat) in [(1, 0), (250, 7), (10_000_000, (MAX_CATEGORIES - 1) as u32)] {
             let sale = Sale::new(price, cat);
             assert!(sale.is_purchase());
             assert_eq!((sale.price(), sale.cat()), (price, cat));
@@ -373,16 +357,17 @@ mod tests {
     }
 
     #[test]
-    fn check_fits_refuses_what_the_records_cannot_hold() {
+    fn fits_only_what_the_packed_records_can_hold() {
         let start = window().start;
         let most = i64::from(i32::MAX) - WEEK;
         let three = products(3);
-        assert!(check_fits(window(), &three).is_ok());
-        assert!(check_fits(Window { start, end: start + most }, &three).is_ok());
-        assert!(check_fits(Window { start, end: start + most + 1 }, &three).is_err());
-        assert!(check_fits(Window { start: at("0000-01-01T00:00:00Z"), end: i64::MAX }, &three).is_err());
-        assert!(check_fits(window(), &products(MAX_CATEGORIES)).is_ok());
-        assert!(check_fits(window(), &products(MAX_CATEGORIES + 1)).is_err());
+        assert!(fits(window(), &three));
+        assert!(fits(Window { start, end: start + most }, &three));
+        assert!(!fits(Window { start, end: start + most + 1 }, &three));
+        assert!(!fits(Window { start, end: at("2026-10-19T00:00:00Z") }, &three));
+        assert!(!fits(Window { start: at("0000-01-01T00:00:00Z"), end: i64::MAX }, &three));
+        assert!(fits(window(), &products(MAX_CATEGORIES)));
+        assert!(!fits(window(), &products(MAX_CATEGORIES + 1)));
     }
 
     #[test]
@@ -480,7 +465,7 @@ mod dedup_tests {
                 ingest: 1_000_000 + i as i64,
                 user: if ok { user } else { NO_USER },
                 ts: ((x >> 32) % 1_000_000) as i32,
-                sale: if ok && x % 7 == 0 { Sale::new(100 + (x >> 40) as u32 % 50_000, (x >> 50) as u16 % 20) } else { Sale::NONE },
+                sale: if ok && x % 7 == 0 { Sale::new(100 + (x >> 40) as u32 % 50_000, (x >> 50) as u32 % 20) } else { Sale::NONE },
             };
             out.push(base);
             match (x >> 8) % 20 {
@@ -502,7 +487,7 @@ mod dedup_tests {
         parsed
     }
 
-    type Row = (u64, i32, u32, u16, bool);
+    type Row = (u64, i32, u32, u32, bool);
 
     /// Per person bucket, the sorted surviving events of a plain dedup.
     fn expected(raws: &[Raw], people: &People) -> Vec<Vec<Row>> {
@@ -555,5 +540,31 @@ mod dedup_tests {
         let got = dedup(Vec::new(), 2, &people);
         assert_eq!(got.len(), PERSON_BUCKETS);
         assert!(got.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn recycles_only_raw_buffers_within_the_ceiling_and_the_pool_cap() {
+        let people = People::build(Vec::new(), 0);
+        let event = |i: usize| Raw { event: key(&format!("e{i}")), ingest: 1, user: key("u1"), ts: i as i32, sale: Sale::NONE };
+        let mut parsed: Parsed = (0..41).map(|_| (0..EVENT_BUCKETS).map(|_| Vec::new()).collect()).collect();
+        for (s, state) in parsed.iter_mut().enumerate() {
+            state[0] = Vec::with_capacity(if s == 0 { 300 } else { 100 });
+            state[0].push(event(s));
+        }
+        for b in 1..EVENT_BUCKETS {
+            for i in 0..5 {
+                parsed[0][b].push(event(100 + 5 * b + i));
+            }
+        }
+        let oversized = 2 * parsed[0][0].capacity();
+        let small = 2 * parsed[1][0].capacity();
+        let buckets = dedup(parsed, 1, &people);
+        let capacities: Vec<usize> = buckets.iter().flatten().map(Vec::capacity).collect();
+        let chunk = 64;
+        assert!(oversized > MAX_RECYCLED_CHUNKS * chunk && (chunk..=MAX_RECYCLED_CHUNKS * chunk).contains(&small));
+        assert!(capacities.contains(&chunk), "{capacities:?}");
+        assert!(capacities.iter().all(|&c| c <= MAX_RECYCLED_CHUNKS * chunk), "{capacities:?}");
+        assert_eq!(capacities.iter().filter(|&&c| c == small).count(), MAX_SPARE_CHUNKS * chunk / small, "{capacities:?}");
+        assert_eq!(buckets.iter().flatten().map(Vec::len).sum::<usize>(), 41 + 5 * (EVENT_BUCKETS - 1));
     }
 }

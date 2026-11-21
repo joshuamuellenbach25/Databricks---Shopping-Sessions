@@ -6,9 +6,6 @@ use crate::ids::Key;
 use crate::lookups::Products;
 use crate::timestamp;
 
-/// Times here are i32 milliseconds from the window start. `events::check_fits`
-/// refuses a window whose span plus 7 days exceeds i32, so a click time plus
-/// `WEEK`, or a session start minus a click time, stays within i32.
 const GAP: i32 = (30 * timestamp::MINUTE) as i32;
 const WEEK: i32 = timestamp::WEEK as i32;
 
@@ -19,7 +16,7 @@ pub struct UserRow {
     pub sessions: i64,
     pub events: i64,
     pub revenue: i64,
-    pub top: Option<u16>,
+    pub top: Option<u32>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -41,7 +38,7 @@ impl Accum {
         Accum { days, cells: vec![Cell::default(); campaigns * days] }
     }
 
-    fn at(&mut self, campaign: u16, day: usize) -> &mut Cell {
+    pub fn at(&mut self, campaign: u32, day: usize) -> &mut Cell {
         &mut self.cells[campaign as usize * self.days + day]
     }
 
@@ -85,7 +82,7 @@ struct DayAgg {
     sessions: i64,
     events: i64,
     revenue: i64,
-    cats: Vec<(u16, i64)>,
+    cats: Vec<(u32, i64)>,
 }
 
 /// Scratch space reused across buckets.
@@ -102,7 +99,7 @@ struct PersonScratch {
     day_agg: Vec<DayAgg>,
     used_days: Vec<usize>,
     day_lo: Vec<usize>,
-    by_campaign: Vec<(u16, i32)>,
+    by_campaign: Vec<(u32, i32)>,
 }
 
 /// One bucket's events and clicks laid out person by person.
@@ -223,7 +220,7 @@ pub fn run_bucket(event_parts: &[Vec<Event>], click_parts: &[Vec<Click>], rules:
     }
 }
 
-fn credit(clicks: &[Click], start: i32) -> u16 {
+fn credit(clicks: &[Click], start: i32) -> u32 {
     let i = clicks.partition_point(|c| c.ts <= start);
     if i == 0 {
         return 0;
@@ -322,7 +319,7 @@ fn person_rows(events: &[Event], clicks: &[Click], rules: &Rules, scratch: &mut 
 
     for &day in &scratch.used_days {
         let agg = &mut scratch.day_agg[day];
-        let mut top: Option<u16> = None;
+        let mut top: Option<u32> = None;
         let mut best = 0i64;
         for &(cat, sum) in &agg.cats {
             let better = match top {
@@ -380,7 +377,7 @@ mod tests {
         let mut rows = Vec::new();
         let mut accum = Accum::new(2, days);
         run_bucket(&[events], &[clicks], &rules, &mut scratch, &mut rows, &mut accum);
-        let mut got: Vec<(i32, i64, i64, i64, Option<u16>)> = rows.iter().map(|r| (r.day - base_day, r.sessions, r.events, r.revenue, r.top)).collect();
+        let mut got: Vec<(i32, i64, i64, i64, Option<u32>)> = rows.iter().map(|r| (r.day - base_day, r.sessions, r.events, r.revenue, r.top)).collect();
         got.sort();
         assert_eq!(got, vec![(0, 1, 2, 700, Some(0)), (2, 1, 1, 0, None)]);
         let cell = |campaign: usize, day: usize| {
@@ -391,5 +388,24 @@ mod tests {
         assert_eq!(cell(0, 2), (1, 0, 0, 0));
         assert_eq!(accum.cells.iter().map(|c| c.sessions).sum::<i64>(), 2);
         assert_eq!(accum.cells.iter().map(|c| c.assisted).sum::<i64>(), 1);
+    }
+
+    #[test]
+    fn campaigns_past_65535_keep_their_own_cells() {
+        let origin = timestamp::parse(b"2026-10-01T00:00:00Z").unwrap();
+        let base_day = timestamp::day_of(origin);
+        let products = Products { map: HashMap::new(), categories: vec![b"unknown".to_vec()], unknown: 0, rank: vec![0] };
+        let rules = Rules { origin, base_day, days: 1, products: &products };
+        let u = Key::from_bytes(b"u");
+        let events = vec![Event { person: u, ts: 0, sale: Sale::NONE }];
+        let clicks = vec![Click { person: u, id: Key::from_bytes(b"k"), ts: 0, campaign: 65_536 }];
+        let mut accum = Accum::new(65_537, 1);
+        run_bucket(&[events], &[clicks], &rules, &mut Scratch::new(1), &mut Vec::new(), &mut accum);
+        let cell = |campaign: usize| {
+            let c = accum.cells[campaign];
+            (c.sessions, c.purchasing, c.revenue, c.assisted)
+        };
+        assert_eq!(cell(65_536), (1, 0, 0, 1));
+        assert_eq!(cell(0), (0, 0, 0, 0));
     }
 }
