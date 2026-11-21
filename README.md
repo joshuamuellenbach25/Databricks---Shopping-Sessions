@@ -15,9 +15,11 @@ The [Shopping Sessions track](https://www.joinbuilders.org/buildathon/tracks/sho
 
 ## Result
 
+![Practice-board time per scored submission, from 1.18 s down to 0.85 s](docs/practice-times.svg)
+
 - Best practice-board time: 0.85 s, for commit 8981d63, which the team entered as its final. The first submission scored 1.18 s, so the run time fell by 28 percent over the event.
 - Before the final, the entered build ran on 60 million generated events with a peak working set of 8.43 GiB and wrote tables identical to those of the previous best build.
-- [docs/STATUS.md](docs/STATUS.md) records each scored change and its measured effect.
+- [docs/STATUS.md](docs/STATUS.md) lists all 11 scored submissions and what each one changed.
 
 ## Input and output
 
@@ -73,6 +75,7 @@ The image starts `FROM scratch` and holds one static musl binary, built for `x86
 - `fixtures/`: small cases with expected tables
 - `docs/adr/`: design decisions
 - `CONTEXT.md`: the domain vocabulary
+- `opt/*` branches: experiments, candidate builds and merge staging; [docs/STATUS.md](docs/STATUS.md) names the scored commits
 
 ## License
 

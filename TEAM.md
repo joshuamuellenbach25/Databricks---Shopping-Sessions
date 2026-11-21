@@ -1,5 +1,5 @@
 # Team
 
 Name: BackwardsDeployeds
-Members:
+Members: Joshua Muellenbach and one teammate
 Engine: Rust, one static binary
