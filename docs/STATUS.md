@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 04:54 UTC.
+Updated 2026-11-21 04:58 UTC.
 
 | Item | Value |
 |---|---|
@@ -13,7 +13,7 @@ Updated 2026-11-21 04:54 UTC.
 
 | Branch | Change | State |
 |---|---|---|
-| opt/cand1 | main plus opt/writer and opt/dedupbuf | four gates pass; Linux dev check and timing running |
+| opt/cand1 | main plus opt/writer and opt/dedupbuf | four gates pass, Linux dev answer matches, faster than main in 3 of 5 local rounds; waits for the Codex reviews |
 | opt/writer | write Parquet columns from reused buffers | gates pass, Linux dev answer matches, Codex review running |
 | opt/dedupbuf | reuse dedup output buffers | gates pass, Linux dev answer matches, Codex review running |
 | opt/coldread | read inputs with pread into reused buffers on Linux | gates pass, Linux dev answer matches, audit and Codex review running |
