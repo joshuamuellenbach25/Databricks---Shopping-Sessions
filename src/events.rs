@@ -217,6 +217,8 @@ impl Filer {
                 bucket.reserve(WAITING);
             }
             stream(&self.waiting[b], bucket);
+            #[cfg(test)]
+            UNFENCED.with(|n| n.fetch_add(1, Ordering::Relaxed));
         }
     }
 
@@ -257,12 +259,19 @@ fn stream(batch: &[Raw; WAITING], bucket: &mut Vec<Raw>) {
     bucket.extend_from_slice(batch);
 }
 
+#[cfg(test)]
+thread_local! {
+    static UNFENCED: std::sync::Arc<AtomicUsize> = std::sync::Arc::default();
+}
+
 #[inline(always)]
-fn fence() {
+pub fn fence() {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
     unsafe {
         std::arch::x86_64::_mm_sfence()
     };
+    #[cfg(test)]
+    UNFENCED.with(|n| n.store(0, Ordering::Relaxed));
 }
 
 pub fn parse(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Result<Parsed> {
@@ -641,6 +650,46 @@ mod tests {
                 (b"u4".to_vec(), at("2026-10-03T12:00:00Z") - start, 0),
             ]
         );
+    }
+
+    #[test]
+    fn scan_workers_fence_their_streamed_batches_before_handing_them_back() {
+        let products = products(3);
+        let ctx = Context::new(window(), &products);
+        let dir = std::env::temp_dir().join(format!("events-fence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut events = 0;
+        for file in 0..16 {
+            let mut text = String::from("event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n");
+            for i in 0..300 {
+                let row = format!("e{file}x{i},u{i},2026-10-03T10:00:00Z,2026-10-03T10:00:05Z,view,p1,\n");
+                for _ in 0..WAITING {
+                    text.push_str(&row);
+                }
+                events += 1;
+            }
+            std::fs::write(dir.join(format!("{file:02}.csv")), text).unwrap();
+        }
+        let paths = crate::scan::csv_files(&dir).unwrap();
+        let people = People::build(Vec::new(), 0);
+        for threads in [1, 2, 3, 8, 16, 64] {
+            let states = crate::scan::run_fields::<7, _, _, _>(&paths, threads, 1 << 12, || (Filer::new(2), UNFENCED.with(std::sync::Arc::clone)), |(filer, _), fields| {
+                if let Some(raw) = parse_event(fields, &ctx) {
+                    filer.file(raw);
+                }
+            })
+            .unwrap();
+            let mut streamed = 0;
+            for (filer, unfenced) in &states {
+                let batches = filer.buckets.iter().map(Vec::len).sum::<usize>() / WAITING;
+                streamed += batches;
+                assert_eq!(unfenced.load(Ordering::Relaxed), 0, "threads {threads}: a worker handed back its filer with streamed batches it had not fenced ({batches} batches)");
+            }
+            assert!(streamed > 0, "threads {threads}: no worker streamed a batch");
+            let survivors = dedup(parse(&paths, threads, &ctx).unwrap(), threads, &people);
+            assert_eq!(survivors.iter().flatten().map(Vec::len).sum::<usize>(), events, "threads {threads}");
+        }
     }
 }
 

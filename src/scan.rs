@@ -83,6 +83,7 @@ where
                             }
                         }
                     }
+                    crate::events::fence();
                     state
                 })
             })
