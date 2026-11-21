@@ -85,7 +85,7 @@ fn run() -> Result<(), Fail> {
     let click_files = scan::csv_files(&data.join("clicks"))?;
     phase("lookups and links");
 
-    let event_ctx = events::Context { window, products: &products };
+    let event_ctx = events::Context::new(window, &products);
     let (people, parsed) = std::thread::scope(|scope| {
         let builder = scope.spawn(|| {
             let started = Instant::now();

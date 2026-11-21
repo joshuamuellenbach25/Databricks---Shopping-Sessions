@@ -3,9 +3,10 @@ use std::io;
 use std::ops::{BitAnd, BitOr, BitXor, Not, Shl, Shr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use memchr::memchr;
-use memmap2::MmapOptions;
+use memmap2::{Mmap, MmapOptions};
 
 /// Every `*.csv` file directly in `dir`, sorted by name.
 pub fn csv_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
@@ -28,10 +29,20 @@ pub fn total_size(paths: &[PathBuf]) -> io::Result<u64> {
     Ok(total)
 }
 
+/// One input file: its length when the scan started and its map, made by
+/// the first worker that takes one of its chunks.
+struct Input {
+    path: PathBuf,
+    len: usize,
+    map: OnceLock<io::Result<Mmap>>,
+}
+
 /// Splits every file into chunks and runs `work(state, data, start, end)` on
-/// each, on `threads` workers with their own state made by `init`. The maps
-/// are never unmapped: the process exits soon after, and unmapping 1.6 GB
-/// costs a quarter second on some systems.
+/// each, on `threads` workers with their own state made by `init`. Workers
+/// open and map the files as they reach them, so that work overlaps parsing
+/// instead of running file by file before it. The maps are never unmapped:
+/// the process exits soon after, and unmapping 1.6 GB costs a quarter
+/// second on some systems.
 fn run_tasks<S, I, W>(paths: &[PathBuf], threads: usize, chunk: usize, init: I, work: W) -> io::Result<Vec<S>>
 where
     S: Send,
@@ -39,25 +50,26 @@ where
     W: Fn(&mut S, &[u8], usize, usize) + Sync,
 {
     let clock = std::time::Instant::now();
-    let mut maps = Vec::with_capacity(paths.len());
+    let mut inputs = Vec::with_capacity(paths.len());
+    let mut tasks = Vec::new();
     for path in paths {
-        let file = File::open(path)?;
-        if file.metadata()?.len() == 0 {
+        let len = std::fs::metadata(path)?.len() as usize;
+        if len == 0 {
+            // No worker opens an empty file, so open it here: one that
+            // cannot be read fails the scan as every other file does.
+            File::open(path)?;
             continue;
         }
-        let map = unsafe { MmapOptions::new().map(&file)? };
-        maps.push(map);
-    }
-    let mut tasks = Vec::new();
-    for (index, map) in maps.iter().enumerate() {
         let mut start = 0;
-        while start < map.len() {
-            tasks.push((index, start, (start + chunk).min(map.len())));
+        while start < len {
+            tasks.push((inputs.len(), start, (start + chunk).min(len)));
             start += chunk;
         }
+        inputs.push(Input { path: path.clone(), len, map: OnceLock::new() });
     }
     let mapped = clock.elapsed();
     let next = AtomicUsize::new(0);
+    let failed: Mutex<Option<io::Error>> = Mutex::new(None);
     let states = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
@@ -68,7 +80,19 @@ where
                         let Some(&(file, start, end)) = tasks.get(t) else {
                             break;
                         };
-                        work(&mut state, &maps[file], start, end);
+                        let input = &inputs[file];
+                        match input.map.get_or_init(|| File::open(&input.path).and_then(|file| unsafe { MmapOptions::new().map(&file) })) {
+                            Ok(map) if map.len() == input.len => work(&mut state, map, start, end),
+                            Ok(map) => {
+                                let message = format!("{}: {} bytes when the scan started, {} when mapped", input.path.display(), input.len, map.len());
+                                failed.lock().unwrap().get_or_insert(io::Error::other(message));
+                                break;
+                            }
+                            Err(error) => {
+                                failed.lock().unwrap().get_or_insert(io::Error::new(error.kind(), format!("{}: {error}", input.path.display())));
+                                break;
+                            }
+                        }
                     }
                     state
                 })
@@ -76,7 +100,10 @@ where
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<S>>()
     });
-    std::mem::forget(maps);
+    if let Some(error) = failed.into_inner().unwrap() {
+        return Err(error);
+    }
+    std::mem::forget(inputs);
     eprintln!("  scan: {} files, map {:.3} s, parse {:.3} s", paths.len(), mapped.as_secs_f64(), (clock.elapsed() - mapped).as_secs_f64());
     Ok(states)
 }
