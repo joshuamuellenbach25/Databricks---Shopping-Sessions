@@ -77,16 +77,11 @@ impl Months {
             return civil_cold(b);
         }
         let k = if in2 { 2 } else { usize::from(in1) };
-        let time = pairs(fit(load(b, 8), &DAY_TIME)?);
-        let seconds = pairs(fit(load(b, 12), &SECONDS)?);
-        let (day, hour, minute, second) = (byte(time, 0), byte(time, 3), byte(time, 6), byte(seconds, 5));
+        let (day, seconds) = clock(b)?;
         if day < self.first[k] || day > self.last[k] {
             return civil_cold(b);
         }
-        if hour >= 24 || minute >= 60 || second >= 60 {
-            return None;
-        }
-        Some(self.day0[k] + day * DAY + hour * HOUR + minute * MINUTE + second * SECOND)
+        Some(self.day0[k] + day * DAY + seconds * SECOND)
     }
 
     #[inline(always)]
@@ -94,6 +89,45 @@ impl Months {
         let ms = self.civil(b.first_chunk()?)?;
         offset(b, ms)
     }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[inline(always)]
+fn clock(b: &[u8; 20]) -> Option<(i64, i64)> {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm_loadu_si128(b.as_ptr().add(4) as *const __m128i);
+        let t = _mm_xor_si128(v, _mm_setr_epi8(0, 0, 0, 0, 48, 48, 84, 48, 48, 58, 48, 48, 58, 48, 48, 0));
+        let limit = _mm_setr_epi8(-1, -1, -1, -1, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, -1);
+        let shaped = _mm_cmpeq_epi8(_mm_max_epu8(t, limit), limit);
+        let digits = _mm_shuffle_epi8(t, _mm_setr_epi8(4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1));
+        let values = _mm_maddubs_epi16(digits, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0));
+        let over = _mm_cmpgt_epi16(values, _mm_setr_epi16(99, 23, 59, 59, 0, 0, 0, 0));
+        if _mm_movemask_epi8(_mm_andnot_si128(over, shaped)) != 0xFFFF {
+            return None;
+        }
+        let parts = _mm_madd_epi16(values, _mm_setr_epi16(0, 3600, 60, 1, 0, 0, 0, 0));
+        let both = _mm_cvtsi128_si64(parts) as u64;
+        Some((i64::from(_mm_cvtsi128_si32(values) as u16), i64::from(both as u32) + (both >> 32) as i64))
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+#[inline(always)]
+fn clock(b: &[u8; 20]) -> Option<(i64, i64)> {
+    clock_by_word(b)
+}
+
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "ssse3"))))]
+#[inline(always)]
+fn clock_by_word(b: &[u8; 20]) -> Option<(i64, i64)> {
+    let time = pairs(fit(load(b, 8), &DAY_TIME)?);
+    let seconds = pairs(fit(load(b, 12), &SECONDS)?);
+    let (day, hour, minute, second) = (byte(time, 0), byte(time, 3), byte(time, 6), byte(seconds, 5));
+    if hour >= 24 || minute >= 60 || second >= 60 {
+        return None;
+    }
+    Some((day, hour * 3600 + minute * 60 + second))
 }
 
 #[cold]
@@ -488,6 +522,33 @@ mod tests {
         let got = parse(text);
         assert_eq!(got, reference::parse(text), "{:?}", String::from_utf8_lossy(text));
         got.is_some()
+    }
+
+    #[test]
+    fn clock_agrees_with_the_word_clock() {
+        let templates = [*b"2026-10-03T23:58:10Z", *b"2028-02-29T00:00:00Z", *b"1999-12-31T09:59:59+", *b"0000-00-00T00:00:00-"];
+        let mut accepted = 0;
+        for template in templates {
+            for at in 0..20 {
+                for c in 0..=255u8 {
+                    let mut text = template;
+                    text[at] = c;
+                    let got = clock(&text);
+                    assert_eq!(got, clock_by_word(&text), "{:?}", String::from_utf8_lossy(&text));
+                    accepted += usize::from(got.is_some());
+                }
+            }
+            for at in [8, 11, 14, 17] {
+                for value in 0..100 {
+                    let mut text = template;
+                    put(&mut text[at..at + 2], value);
+                    let got = clock(&text);
+                    assert_eq!(got, clock_by_word(&text), "{:?}", String::from_utf8_lossy(&text));
+                    accepted += usize::from(got.is_some());
+                }
+            }
+        }
+        assert!(accepted > 4 * (9 * 256 + 4 * 24), "{accepted}");
     }
 
     #[test]
