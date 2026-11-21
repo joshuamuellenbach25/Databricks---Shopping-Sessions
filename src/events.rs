@@ -121,8 +121,6 @@ pub type Parsed = Vec<Vec<Vec<Raw>>>;
 /// Surviving events per person bucket, split into parts that together hold the bucket.
 pub type Buckets<T> = Vec<Vec<Vec<T>>>;
 
-/// A price: digits only, from 1 to 10,000,000. Up to 8 digits are read as
-/// one word; longer prices (leading zeros) byte by byte.
 #[inline(always)]
 fn parse_price(b: &[u8]) -> Option<u32> {
     if !(1..=8).contains(&b.len()) {

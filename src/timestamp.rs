@@ -78,12 +78,8 @@ const MARCH_DAYS: [i64; 16] = march_days();
 /// The day count of `civil` on 1970-01-01.
 const EPOCH: i64 = 865_565;
 
-/// Years that `civil` counts, from year 0 of its March-based count (400
-/// added years keep it positive) through year 9999.
 const COUNTED_YEARS: usize = 400 + 10_000;
 
-/// Days from 1970-01-01 to March 1 of each counted year: a table lookup in
-/// place of the three divisions of the leap-year count.
 static YEAR_DAYS: [i32; COUNTED_YEARS] = year_days();
 
 const fn year_days() -> [i32; COUNTED_YEARS] {
@@ -190,14 +186,10 @@ fn digits(b: &[u8]) -> Option<i64> {
     Some((eight(high) * 100_000_000 + eight(low)) as i64)
 }
 
-/// The number written by 1 to 8 ASCII digits, read as one word with `0`s
-/// filling it on the left; None when any byte is not a digit. Reads only
-/// the bytes of `b`.
 #[inline(always)]
 pub fn short_digits(b: &[u8]) -> Option<u64> {
     let n = b.len();
     debug_assert!((1..=8).contains(&n));
-    // The bytes of `b`, the first lowest; two overlapping halves agree.
     let word = if n >= 4 {
         let first = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
         let last = u32::from_le_bytes([b[n - 4], b[n - 3], b[n - 2], b[n - 1]]);
