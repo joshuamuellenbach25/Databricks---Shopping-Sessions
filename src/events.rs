@@ -16,7 +16,7 @@ pub const EVENT_BUCKETS: usize = 1 << EVENT_BITS;
 /// Buckets by person for sessions.
 pub const PERSON_BITS: u32 = 8;
 pub const PERSON_BUCKETS: usize = 1 << PERSON_BITS;
-pub const CHUNK: usize = 2 << 20;
+pub const CHUNK: usize = 512 << 10;
 /// How many survivors ahead the person table slot is prefetched.
 pub const PREFETCH_AHEAD: usize = 16;
 

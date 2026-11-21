@@ -8,7 +8,6 @@ publish = false
 [dependencies]
 hashbrown = "0.17"
 memchr = "2.8"
-memmap2 = "0.9"
 mimalloc = { version = "0.1", default-features = false }
 parquet = { version = "60", default-features = false }
 
