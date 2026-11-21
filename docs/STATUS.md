@@ -1,12 +1,12 @@
 # Status
 
-Updated 2026-11-21 08:50 UTC.
+Updated 2026-11-21 08:52 UTC.
 
 | Item | Value |
 |---|---|
 | Best practice score | 1.04 s (commit 5cd5648, entered in the final; 79a758b also scored 1.04 s) |
-| Board leader | 0.42 s |
-| Target (leader minus 10 percent) | 0.378 s |
+| Board leader | 0.36 s |
+| Target (leader minus 10 percent) | 0.324 s |
 | Main | solver code of 5cd5648 (parse stage redesign plus early unmapping and leaner output writing, no code comments) |
 
 ## Work in progress
