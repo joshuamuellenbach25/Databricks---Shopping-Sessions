@@ -55,22 +55,79 @@ fn long_ids() -> &'static Mutex<LongIds> {
     LONG_IDS.get_or_init(|| Mutex::new(LongIds::default()))
 }
 
+/// Bits 0 to 4, and bit 5, of each of the `PACKED_MAX` 6-bit code fields.
+const FIELD_LOW: u64 = every_field(0x1F);
+const FIELD_HIGH: u64 = every_field(0x20);
+
+const fn every_field(bits: u64) -> u64 {
+    let mut out = 0;
+    let mut i = 0;
+    while i < PACKED_MAX {
+        out |= bits << (6 * i);
+        i += 1;
+    }
+    out
+}
+
+#[inline(always)]
+fn code(c: u8) -> u64 {
+    u64::from(CODE[c as usize])
+}
+
+/// The bytes of an ID shorter than 8 bytes in one word, the first byte
+/// lowest, zeros past the end.
+#[inline(always)]
+fn short_word(b: &[u8]) -> u64 {
+    let n = b.len();
+    if n >= 4 {
+        let first = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        let last = u32::from_le_bytes([b[n - 4], b[n - 3], b[n - 2], b[n - 1]]);
+        u64::from(first) | (u64::from(last) << (8 * (n - 4)))
+    } else if n > 0 {
+        u64::from(b[0]) | (u64::from(b[n / 2]) << (8 * (n / 2))) | (u64::from(b[n - 1]) << (8 * (n - 1)))
+    } else {
+        0
+    }
+}
+
+/// The packed key of an ID of at most `PACKED_MAX` bytes from the packable
+/// alphabet; None for any other ID.
+#[inline(always)]
+fn pack(b: &[u8]) -> Option<Key> {
+    let n = b.len();
+    if n > PACKED_MAX {
+        return None;
+    }
+    let value = if n >= 8 {
+        let mut value = 0;
+        for (i, &c) in b[..8].iter().enumerate() {
+            value |= code(c) << (6 * (PACKED_MAX - 1 - i));
+        }
+        // Bytes 8 and 9, zero past the end.
+        let tail = u32::from(u16::from_le_bytes([b[n - 2], b[n - 1]])) >> (8 * (PACKED_MAX - n));
+        value | (code(tail as u8) << 6) | code((tail >> 8) as u8)
+    } else {
+        let word = short_word(b);
+        let mut value = 0;
+        for i in 0..8 {
+            value |= code((word >> (8 * i)) as u8) << (6 * (PACKED_MAX - 1 - i));
+        }
+        value
+    };
+    // A byte outside the alphabet has code 0, as does every position past
+    // the end: the ID packs when exactly its n leading fields are nonzero.
+    let nonzero = (((value & FIELD_LOW) + FIELD_LOW) | value) & FIELD_HIGH;
+    let leading = FIELD_HIGH & !((1u64 << (6 * (PACKED_MAX - n))) - 1);
+    (nonzero == leading).then_some(Key(value))
+}
+
 impl Key {
     #[inline]
     pub fn from_bytes(b: &[u8]) -> Key {
-        if b.len() <= PACKED_MAX {
-            let mut value = 0u64;
-            let mut packable = true;
-            for &c in b {
-                let code = CODE[c as usize];
-                packable &= code != 0;
-                value = (value << 6) | u64::from(code);
-            }
-            if packable {
-                return Key(value << (6 * (PACKED_MAX - b.len())));
-            }
+        match pack(b) {
+            Some(key) => key,
+            None => Key::intern(b),
         }
-        Key::intern(b)
     }
 
     #[cold]
@@ -150,5 +207,73 @@ mod tests {
                 assert_eq!(Key::from_bytes(a).0.cmp(&Key::from_bytes(b).0), a.cmp(b));
             }
         }
+    }
+
+    /// The byte-at-a-time packing that `pack` must agree with on every ID.
+    fn reference_pack(b: &[u8]) -> Option<u64> {
+        if b.len() > PACKED_MAX {
+            return None;
+        }
+        let mut value = 0u64;
+        let mut packable = true;
+        for &c in b {
+            let code = CODE[c as usize];
+            packable &= code != 0;
+            value = (value << 6) | u64::from(code);
+        }
+        packable.then(|| value << (6 * (PACKED_MAX - b.len())))
+    }
+
+    fn agree(id: &[u8]) -> bool {
+        let got = pack(id).map(|k| k.0);
+        assert_eq!(got, reference_pack(id), "{id:?}");
+        if let Some(value) = got {
+            assert_eq!(Key::from_bytes(id), Key(value), "{id:?}");
+        }
+        got.is_some()
+    }
+
+    #[test]
+    fn pack_agrees_with_the_reference_on_every_byte_at_every_position() {
+        let base = b"azAZ09_m5Qx";
+        let mut packed = 0;
+        for len in 0..=base.len() {
+            packed += usize::from(agree(&base[..len]));
+            for at in 0..len {
+                for c in 0..=255u8 {
+                    let mut id = base[..len].to_vec();
+                    id[at] = c;
+                    packed += usize::from(agree(&id));
+                }
+            }
+        }
+        // The 11 untouched IDs of at most 10 bytes, the empty one included,
+        // plus 63 of the 256 bytes at each of the 55 positions of those IDs.
+        assert_eq!(packed, 1 + PACKED_MAX + 63 * 55);
+    }
+
+    #[test]
+    fn pack_agrees_with_the_reference_on_random_ids() {
+        let alphabet = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+        let edges = [0x00, 0x09, 0x0D, b' ', b'"', b'-', b'/', b':', b'@', b'[', b'^', b'`', b'{', 0x7F, 0x80, 0xFF];
+        let mut x: u64 = 99;
+        let mut packed = 0;
+        for _ in 0..1_000_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let len = (x >> 60) as usize % (PACKED_MAX + 3);
+            let mut y = x;
+            let id: Vec<u8> = (0..len)
+                .map(|_| {
+                    y = y.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    if (y >> 59) % 10 == 0 {
+                        edges[(y >> 40) as usize % edges.len()]
+                    } else {
+                        alphabet[(y >> 40) as usize % alphabet.len()]
+                    }
+                })
+                .collect();
+            packed += usize::from(agree(&id));
+        }
+        assert!(packed > 200_000, "{packed}");
     }
 }
