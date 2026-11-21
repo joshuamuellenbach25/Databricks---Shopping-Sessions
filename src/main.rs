@@ -73,9 +73,6 @@ fn run() -> Result<(), Fail> {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, usize::from));
 
     let window = lookups::read_manifest(&data)?;
-    // The links come first, so the person table builds while this thread
-    // reads the lookups: its workers use the CPUs this thread leaves idle and
-    // are done before the events parse needs every CPU.
     let link_pairs = links::collect(&scan::csv_files(&data.join("links"))?, threads)?;
     let builder = std::thread::spawn(move || {
         let started = Instant::now();

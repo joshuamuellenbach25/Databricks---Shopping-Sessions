@@ -16,19 +16,12 @@ pub struct People {
 
 const SLOT_MIX: u64 = 0xD6E8_FEB8_6659_FD93;
 
-/// `build` splits the IDs of the links into `PARTS` parts by the top bits of
-/// their slot hash: each part is numbered in a table small enough to stay in
-/// cache, and its names fill one stretch of the name table.
 const PART_BITS: u32 = 8;
 const PARTS: usize = 1 << PART_BITS;
 
-/// How far ahead `build` starts loading the union-find words it will read:
-/// joining, the nodes of the link `FAR` ahead and their parents `NEAR`
-/// ahead; naming, the parent of the node `FAR` ahead.
 const FAR: usize = 16;
 const NEAR: usize = 8;
 
-/// Fewer links than this are joined on one thread.
 const MIN_PARALLEL: usize = 1 << 14;
 
 #[inline(always)]
@@ -42,15 +35,10 @@ fn part(id: u64) -> usize {
 }
 
 impl People {
-    /// Joins the two IDs of every link into one person, on up to `threads`
-    /// threads. The links may come in any number of lists; link i is the
-    /// i-th counting through the lists in order. A link with an empty side is
-    /// skipped, as the rules drop such links.
     pub fn build(links: &[Vec<(Key, Key)>], threads: usize) -> People {
         let total: usize = links.iter().map(Vec::len).sum();
         assert!(total <= u32::MAX as usize / 2, "{total} links: their sides do not fit 32-bit numbers");
         let workers = if total < MIN_PARALLEL { 1 } else { threads.clamp(1, PARTS) };
-        // Count the kept sides of each worker's stretch of links by part.
         let starts: Vec<usize> = links
             .iter()
             .scan(0, |at, list| {
@@ -68,9 +56,6 @@ impl People {
             });
             counts
         });
-        // Every kept side as an [ID, side] record, part by part: part p's
-        // records start at `edges[p]`, and in each part every worker has a
-        // piece to fill. Sides 2i and 2i + 1 are the two IDs of link i.
         let mut edges = vec![0; PARTS + 1];
         for p in 0..PARTS {
             edges[p + 1] = edges[p] + counted.iter().map(|counts| counts[p]).sum::<usize>();
@@ -96,16 +81,8 @@ impl People {
             });
             assert!(mine.iter().zip(&filled).all(|(piece, &n)| piece.len() == n), "a worker filled its pieces partly");
         });
-        // SAFETY: the pieces cover the first edges[PARTS] records, and every
-        // worker wrote each record of its pieces (the assert above).
         unsafe { records.set_len(edges[PARTS]) };
         let nodes = &records;
-        // Number the distinct IDs, each worker taking a stretch of parts: the
-        // k-th distinct ID of part p is node edges[p] + k, and that record
-        // becomes the node's [ID, union-find word]. A root's word is its ID,
-        // any other node's word is LINK and its parent. `node_of[side]` is
-        // the node of that side's ID. A slot of `seen` left by an earlier
-        // part holds a node below `first` and counts as empty.
         let node_of: Vec<AtomicU32> = (0..2 * total).map(|_| AtomicU32::new(0)).collect();
         let parts_of = |w: usize| (PARTS * w / workers, PARTS * (w + 1) / workers);
         let numbered: Vec<(Vec<u32>, u64)> = run((0..workers).collect(), |w| {
@@ -131,7 +108,6 @@ impl People {
                         if slot_id == 0 || slot_node < first {
                             let node = first + count as u32;
                             seen[i] = (id, node);
-                            // Row r is read already and count <= r.
                             rows[count][0].store(id, Relaxed);
                             rows[count][1].store(id, Relaxed);
                             every_bit |= id;
@@ -149,11 +125,6 @@ impl People {
         let counts: Vec<u32> = numbered.iter().flat_map(|(counts, _)| counts.iter().copied()).collect();
         let every_bit = numbered.iter().fold(0, |bits, &(_, b)| bits | b);
         assert!(every_bit & LINK == 0, "an ID key uses the bit that marks a union-find parent");
-        // Join the two roots of every link under the one with the smaller ID,
-        // each worker taking a stretch of the links, so each root is the
-        // smallest ID of its person, the person's name. Each join leaves one
-        // more linked ID named by another. A skipped link has node 0 on both
-        // sides.
         let node = |side: usize| node_of[side].load(Relaxed) as usize;
         let joined: Vec<usize> = run((0..if nodes.is_empty() { 0 } else { workers }).collect(), |w| {
             let (lo, hi) = link_range(w);
@@ -173,10 +144,6 @@ impl People {
         });
         let linked: usize = joined.iter().sum();
         drop(node_of);
-        // Name every node that is no root. Each worker writes every slot of
-        // the stretch of the table its parts hash to, an entry or empty; an
-        // entry whose probe runs off the end of its stretch goes in
-        // afterwards, probing on as usual.
         let capacity = (linked * 2).next_power_of_two().max(16);
         let (mask, shift) = (capacity - 1, 64 - capacity.trailing_zeros());
         let mut slots: Vec<[u64; 2]> = Vec::with_capacity(capacity);
@@ -205,7 +172,9 @@ impl People {
                         continue;
                     }
                     let id = nodes[node][0].load(Relaxed);
-                    let entry = [id, root_id(nodes, word)];
+                    #[cfg(test)]
+                    tests::count_hops(nodes, node);
+                    let entry = [id, find(nodes, node).1];
                     let mut i = (mix(id) >> shift) as usize - start;
                     loop {
                         match taken.get(i) {
@@ -230,8 +199,6 @@ impl People {
             }
             spill
         });
-        // SAFETY: the stretches cover the first `capacity` slots, and every
-        // worker wrote each slot of its stretch, an entry or empty.
         unsafe { slots.set_len(capacity) };
         for entry in spilled.into_iter().flatten() {
             let mut i = (mix(entry[0]) >> shift) as usize;
@@ -280,13 +247,8 @@ impl People {
     }
 }
 
-/// Marks a union-find word as a parent node; no ID has this bit (packed IDs
-/// fill bits 0 to 59, interned ones bit 63 and a small index).
 const LINK: u64 = 1 << 62;
 
-/// Calls `f(i, a, b)` for every link i of `range` whose sides are both
-/// nonempty, counting the links through the lists; `starts` holds the
-/// number of each list's first link.
 fn each_link(links: &[Vec<(Key, Key)>], starts: &[usize], (lo, hi): (usize, usize), mut f: impl FnMut(usize, Key, Key)) {
     for (list, &start) in links.iter().zip(starts) {
         let (from, to) = (lo.max(start), hi.min(start + list.len()));
@@ -300,7 +262,6 @@ fn each_link(links: &[Vec<(Key, Key)>], starts: &[usize], (lo, hi): (usize, usiz
     }
 }
 
-/// Starts loading node `i`.
 #[inline(always)]
 fn touch(nodes: &[[AtomicU64; 2]], i: usize) {
     #[cfg(target_arch = "x86_64")]
@@ -312,7 +273,6 @@ fn touch(nodes: &[[AtomicU64; 2]], i: usize) {
     let _ = (nodes, i);
 }
 
-/// Starts loading the parent of node `i`, if it has one.
 #[inline(always)]
 fn touch_parent(nodes: &[[AtomicU64; 2]], i: usize) {
     let word = nodes[i][1].load(Relaxed);
@@ -321,17 +281,6 @@ fn touch_parent(nodes: &[[AtomicU64; 2]], i: usize) {
     }
 }
 
-/// The ID of the root above a node whose union-find word is `word`.
-#[inline(always)]
-fn root_id(nodes: &[[AtomicU64; 2]], mut word: u64) -> u64 {
-    while word & LINK != 0 {
-        word = nodes[(word ^ LINK) as usize][1].load(Relaxed);
-    }
-    word
-}
-
-/// Runs `work` on every job, the first on this thread and each other on a
-/// thread of its own, and returns the results in job order.
 fn run<J: Send, T: Send>(jobs: Vec<J>, work: impl Fn(J) -> T + Sync) -> Vec<T> {
     let mut jobs = jobs.into_iter();
     let Some(first) = jobs.next() else {
@@ -346,7 +295,6 @@ fn run<J: Send, T: Send>(jobs: Vec<J>, work: impl Fn(J) -> T + Sync) -> Vec<T> {
     })
 }
 
-/// The root of node `i` and its ID, halving the path on the way.
 #[inline(always)]
 fn find(nodes: &[[AtomicU64; 2]], mut i: usize) -> (usize, u64) {
     loop {
@@ -359,18 +307,11 @@ fn find(nodes: &[[AtomicU64; 2]], mut i: usize) -> (usize, u64) {
         if up & LINK == 0 {
             return (parent, up);
         }
-        // A node that is no root never becomes one again, and `up` names
-        // one of its ancestors, so any thread may store this at any time.
         nodes[i][1].store(up, Relaxed);
         i = (up ^ LINK) as usize;
     }
 }
 
-/// Joins the persons of nodes `a` and `b`: the root with the larger ID goes
-/// under the other. Returns whether they were two persons. Every parent has
-/// a smaller ID than its child, so threads joining at once make no cycle,
-/// and a root that another thread joined first fails the exchange and the
-/// join starts over.
 #[inline(always)]
 fn join(nodes: &[[AtomicU64; 2]], a: usize, b: usize) -> bool {
     loop {
@@ -388,9 +329,28 @@ fn join(nodes: &[[AtomicU64; 2]], a: usize, b: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use hashbrown::HashMap;
 
     use super::*;
+
+    thread_local! {
+        static HOPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn count_hops(nodes: &[[AtomicU64; 2]], mut node: usize) {
+        let mut hops = 0;
+        loop {
+            let word = nodes[node][1].load(Relaxed);
+            if word & LINK == 0 {
+                break;
+            }
+            node = (word ^ LINK) as usize;
+            hops += 1;
+        }
+        HOPS.with(|total| total.set(total.get() + hops));
+    }
 
     fn k(s: &str) -> Key {
         Key::from_bytes(s.as_bytes())
@@ -431,8 +391,6 @@ mod tests {
             let b = format!("u{}", (x >> 10) % 30_000);
             pairs.push((k(&a), k(&b)));
         }
-        // One to 256 workers (one per part, so many stretch ends where an
-        // entry spills), over lists split unevenly, one of them empty.
         let lists = vec![pairs[..7000].to_vec(), Vec::new(), pairs[7000..].to_vec()];
         let built: Vec<People> = [1, 2, 7, 256].iter().map(|&threads| People::build(&lists, threads)).collect();
         let mut parent: HashMap<String, String> = HashMap::new();
@@ -481,8 +439,6 @@ mod tests {
 
     #[test]
     fn workers_join_a_long_chain_and_a_hub_into_one_person() {
-        // Enough links for several workers: a chain of 12,000 links in a
-        // scattered order, 8,000 IDs on one hub, and one link between them.
         let mut pairs = Vec::new();
         for j in 0..12_000 {
             let i = j * 7_919 % 12_000;
@@ -503,41 +459,81 @@ mod tests {
         }
     }
 
-    #[test]
-    fn threads_racing_to_join_one_root_lose_no_join() {
-        // Node 0 has the largest ID. Started together, each thread joins its
-        // own new nodes to node 0, the threads taking the IDs below in turn
-        // from the top, so nearly every join puts the person's root under a
-        // smaller ID and the threads race for that one root word.
+    fn race_to_one_root(refused: Option<usize>) -> Result<(), String> {
         const THREADS: usize = 8;
         const EACH: usize = 20_000;
+        const WAIT: u32 = 0;
+        const GO: u32 = 1;
+        const STOP: u32 = 2;
         let top: u64 = 1 << 40;
         let node = |i: usize, t: usize| 1 + i * THREADS + t;
         let nodes: Vec<[AtomicU64; 2]> = (0..(1 + THREADS * EACH) as u64).map(|n| top - n).map(|id| [AtomicU64::new(id), AtomicU64::new(id)]).collect();
-        let start = std::sync::Barrier::new(THREADS);
+        let signal = AtomicU32::new(WAIT);
         let joins: usize = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..THREADS)
-                .map(|t| {
-                    let (nodes, start) = (&nodes, &start);
-                    scope.spawn(move || {
-                        start.wait();
-                        (0..EACH).filter(|&i| join(nodes, node(i, t), 0)).count()
+            let mut handles = Vec::with_capacity(THREADS);
+            for t in 0..THREADS {
+                let (nodes, signal) = (&nodes, &signal);
+                let started = if refused == Some(t) {
+                    Err(std::io::Error::other("refused by the test"))
+                } else {
+                    std::thread::Builder::new().spawn_scoped(scope, move || {
+                        let mut now = signal.load(Relaxed);
+                        while now == WAIT {
+                            std::thread::yield_now();
+                            now = signal.load(Relaxed);
+                        }
+                        if now == GO { (0..EACH).filter(|&i| join(nodes, node(i, t), 0)).count() } else { 0 }
                     })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).sum()
-        });
+                };
+                match started {
+                    Ok(handle) => handles.push(handle),
+                    Err(error) => {
+                        signal.store(STOP, Relaxed);
+                        return Err(format!("thread {t} did not start: {error}"));
+                    }
+                }
+            }
+            signal.store(GO, Relaxed);
+            Ok(handles.into_iter().map(|h| h.join().unwrap()).sum::<usize>())
+        })?;
         assert_eq!(joins, THREADS * EACH);
         let name = top - (THREADS * EACH) as u64;
         for n in 0..nodes.len() {
-            assert_eq!(root_id(&nodes, nodes[n][1].load(Relaxed)), name, "node {n}");
+            assert_eq!(find(&nodes, n).1, name, "node {n}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn threads_racing_to_join_one_root_lose_no_join() {
+        assert_eq!(race_to_one_root(None), Ok(()));
+    }
+
+    #[test]
+    fn a_thread_that_does_not_start_ends_the_race() {
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || send.send(race_to_one_root(Some(7))));
+        let ended = receive.recv_timeout(std::time::Duration::from_secs(60));
+        assert_eq!(ended, Ok(Err("thread 7 did not start: refused by the test".to_string())));
+    }
+
+    #[test]
+    fn naming_a_descending_chain_reads_few_parents() {
+        let n = 16_000;
+        let id = |i: usize| k(&format!("u{i:06}"));
+        let pairs: Vec<(Key, Key)> = (1..=n).rev().map(|i| (id(i - 1), id(i))).collect();
+        HOPS.with(|hops| hops.set(0));
+        let people = People::build(&[pairs], 1);
+        let hops = HOPS.with(Cell::get);
+        assert!(hops <= 8 * n, "naming {n} chained IDs read {hops} parents");
+        assert_eq!(people.linked(), n);
+        for i in 0..=n {
+            assert_eq!(people.name_of(id(i)), id(0), "u{i:06}");
         }
     }
 
     #[test]
     fn empty_sides_are_skipped_and_long_ids_compare_as_bytes() {
-        // "a b" and the 12-byte ID are interned keys, which order apart
-        // from packed ones; byte-wise, "a b" is the smallest of the three.
         let people = People::build(&[vec![(k(""), k("u1")), (k("u2"), k("u1")), (k("zzzzzzzzzzzz"), k("a b")), (k("u5"), k("zzzzzzzzzzzz"))]], 1);
         assert_eq!(people.name_of(k("u2")), k("u1"));
         assert_eq!(people.name_of(k("u1")), k("u1"));
