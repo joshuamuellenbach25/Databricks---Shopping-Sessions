@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 09:12 UTC.
+Updated 2026-11-21 09:22 UTC.
 
 | Item | Value |
 |---|---|
@@ -21,7 +21,8 @@ Updated 2026-11-21 09:12 UTC.
 | opt/directio | Linux input reads that skip the page cache when the data is not resident, overlapped with parsing | ee748b6 on the old main; gates pass on Windows (44 tests, 36/36, dev MATCH, 6/6), where only the fallback path runs; Codex re-check left 2 test-only items; the Linux code has not been compiled yet (no Linux target or Docker here) |
 | opt/sessions2 | sessions and output rewrite (25 percent of runtime) | a90c101 on opt/cand1; sessions and output 0.174 s to 0.097 s, lower in 16 of 16 rounds; gates pass; Codex confirmed 3 items (stale parts when an output folder is reused with fewer threads, empty parts left by a failed run, added comments); fix 9e9c9f3 stages output parts and publishes them after a whole run; Codex re-check running |
 | opt/cand5 | the 0.96 s main plus the direct-read change from opt/cand4 | port, gates and Codex review running |
-| opt/parse3 | events parse throughput on the current main (45 percent of runtime, about 0.37 GB/s per thread now) | building |
+| opt/parse3 | events parse throughput (block size of the record flush) | cc8936e; gates pass; about 2 percent faster in fast-mode rounds, under the 5 percent floor; stopped |
+| opt/parse4 | events-only tokenizer and a cheaper first touch of input pages, on the 0.96 s main | building |
 | opt/dedup2 | events dedup and clicks on the current main (24 percent of runtime) | building |
 | opt/cand4 | the 1.04 s main plus the opt/directio change, comments stripped | 51d0233; gates pass on Windows (55 tests, 36/36, dev MATCH, 6/6); Codex confirmed 1 item (overlay mounts refuse the read probe; fixed: unknown residency now reads directly), 0 left; the Linux code is not compiled here; needs a port onto the 0.96 s main |
 | opt/cand3 | main plus only the opt/sessions2 change, comments stripped | 0890fe7; gates pass (48 tests, 36/36, dev MATCH, 6/6); reference matched in 228 of 228 runs; Codex confirmed 5 items, none in a single fresh run (reused output folder, failed rerun, per-worker category copy, open file handles, a 2^31 event limit); fix 8643225 (output published only after a whole run, writer text no longer leaked); bench median 1738 ms against 1914 ms, 16 of 25 rounds; scored 0.96 s (receipt BB-FEAC4A51); merged into main |
