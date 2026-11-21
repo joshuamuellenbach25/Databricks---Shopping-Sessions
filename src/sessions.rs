@@ -1,3 +1,5 @@
+use hashbrown::HashMap;
+
 use crate::clicks::Click;
 use crate::events::Event;
 use crate::ids::Key;
@@ -71,10 +73,16 @@ struct DayAgg {
     cats: Vec<(u16, i64)>,
 }
 
-/// Scratch space reused across persons.
+/// Scratch space reused across buckets.
 pub struct Scratch {
-    /// Seconds this thread spent sorting events and clicks.
+    /// Seconds this thread spent grouping events and clicks by person.
     pub sort_seconds: f64,
+    person: PersonScratch,
+    group: GroupScratch,
+}
+
+/// Scratch space reused across persons.
+struct PersonScratch {
     sessions: Vec<Session>,
     day_agg: Vec<DayAgg>,
     used_days: Vec<usize>,
@@ -82,43 +90,121 @@ pub struct Scratch {
     by_campaign: Vec<(u16, i64)>,
 }
 
+/// One bucket's events and clicks laid out person by person.
+#[derive(Default)]
+struct GroupScratch {
+    /// Person to its group number, in order of first appearance.
+    index: HashMap<Key, u32>,
+    /// Group number of each event and click, in reading order; clicks of a
+    /// person without events get `NO_GROUP`.
+    event_tag: Vec<u32>,
+    click_tag: Vec<u32>,
+    /// Start of each group in `events` and `clicks`, plus the total.
+    event_off: Vec<u32>,
+    click_off: Vec<u32>,
+    fill: Vec<u32>,
+    events: Vec<Event>,
+    clicks: Vec<Click>,
+}
+
+const NO_GROUP: u32 = u32::MAX;
+
 impl Scratch {
     pub fn new(days: usize) -> Scratch {
         Scratch {
             sort_seconds: 0.0,
-            sessions: Vec::new(),
-            day_agg: (0..days).map(|_| DayAgg::default()).collect(),
-            used_days: Vec::new(),
-            day_lo: vec![0; days + 1],
-            by_campaign: Vec::new(),
+            person: PersonScratch {
+                sessions: Vec::new(),
+                day_agg: (0..days).map(|_| DayAgg::default()).collect(),
+                used_days: Vec::new(),
+                day_lo: vec![0; days + 1],
+                by_campaign: Vec::new(),
+            },
+            group: GroupScratch::default(),
         }
     }
 }
 
-/// Sessionizes, credits, assists and aggregates one bucket of persons.
-pub fn run_bucket(events: &mut [Event], clicks: &mut [Click], rules: &Rules, scratch: &mut Scratch, rows: &mut Vec<UserRow>, accum: &mut Accum) {
+/// Turns per-group counts into start offsets followed by the total.
+fn offsets(counts: &mut Vec<u32>) -> usize {
+    let mut total = 0u32;
+    for count in counts.iter_mut() {
+        let n = *count;
+        *count = total;
+        total += n;
+    }
+    counts.push(total);
+    total as usize
+}
+
+/// Sessionizes, credits, assists and aggregates one bucket of persons, given
+/// as parts that together hold every event and click of those persons.
+pub fn run_bucket(event_parts: &[Vec<Event>], click_parts: &[Vec<Click>], rules: &Rules, scratch: &mut Scratch, rows: &mut Vec<UserRow>, accum: &mut Accum) {
     let started = std::time::Instant::now();
-    events.sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)));
-    clicks.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| a.id.cmp_bytes(b.id)));
-    scratch.sort_seconds += started.elapsed().as_secs_f64();
-    let mut ci = 0;
-    let mut i = 0;
-    while i < events.len() {
-        let person = events[i].person;
-        let mut j = i;
-        while j < events.len() && events[j].person == person {
-            j += 1;
+    let Scratch { sort_seconds, person, group: g } = scratch;
+    let Some(&first_event) = event_parts.iter().flatten().next() else {
+        return;
+    };
+    g.index.clear();
+    g.event_tag.clear();
+    g.event_off.clear();
+    for event in event_parts.iter().flatten() {
+        let next = g.event_off.len() as u32;
+        let tag = *g.index.entry(event.person).or_insert(next);
+        if tag == next {
+            g.event_off.push(0);
         }
-        while ci < clicks.len() && clicks[ci].person < person {
-            ci += 1;
+        g.event_off[tag as usize] += 1;
+        g.event_tag.push(tag);
+    }
+    let groups = g.event_off.len();
+    let total = offsets(&mut g.event_off);
+    if g.events.len() < total {
+        g.events.resize(total, first_event);
+    }
+    g.fill.clear();
+    g.fill.extend_from_slice(&g.event_off[..groups]);
+    for (event, &tag) in event_parts.iter().flatten().zip(&g.event_tag) {
+        let slot = &mut g.fill[tag as usize];
+        g.events[*slot as usize] = *event;
+        *slot += 1;
+    }
+
+    g.click_tag.clear();
+    g.click_off.clear();
+    g.click_off.resize(groups, 0);
+    let mut first_click = None;
+    for click in click_parts.iter().flatten() {
+        let tag = g.index.get(&click.person).copied().unwrap_or(NO_GROUP);
+        if tag != NO_GROUP {
+            g.click_off[tag as usize] += 1;
+            first_click.get_or_insert(*click);
         }
-        let mut cj = ci;
-        while cj < clicks.len() && clicks[cj].person == person {
-            cj += 1;
+        g.click_tag.push(tag);
+    }
+    let kept = offsets(&mut g.click_off);
+    if let Some(first_click) = first_click {
+        if g.clicks.len() < kept {
+            g.clicks.resize(kept, first_click);
         }
-        person_rows(&events[i..j], &clicks[ci..cj], rules, scratch, rows, accum);
-        ci = cj;
-        i = j;
+        g.fill.clear();
+        g.fill.extend_from_slice(&g.click_off[..groups]);
+        for (click, &tag) in click_parts.iter().flatten().zip(&g.click_tag) {
+            if tag != NO_GROUP {
+                let slot = &mut g.fill[tag as usize];
+                g.clicks[*slot as usize] = *click;
+                *slot += 1;
+            }
+        }
+    }
+    *sort_seconds += started.elapsed().as_secs_f64();
+
+    for t in 0..groups {
+        let events = &mut g.events[g.event_off[t] as usize..g.event_off[t + 1] as usize];
+        events.sort_unstable_by_key(|e| e.ts);
+        let clicks = &mut g.clicks[g.click_off[t] as usize..g.click_off[t + 1] as usize];
+        clicks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp_bytes(b.id)));
+        person_rows(events, clicks, rules, person, rows, accum);
     }
 }
 
@@ -135,7 +221,7 @@ fn credit(clicks: &[Click], start: i64) -> u16 {
     clicks[j].campaign
 }
 
-fn person_rows(events: &[Event], clicks: &[Click], rules: &Rules, scratch: &mut Scratch, rows: &mut Vec<UserRow>, accum: &mut Accum) {
+fn person_rows(events: &[Event], clicks: &[Click], rules: &Rules, scratch: &mut PersonScratch, rows: &mut Vec<UserRow>, accum: &mut Accum) {
     let person = events[0].person;
     scratch.sessions.clear();
     let mut k = 0;

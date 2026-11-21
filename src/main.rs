@@ -111,8 +111,6 @@ fn run() -> Result<(), Fail> {
                     let mut accum = Accum::new(campaigns.ids.len(), days);
                     let mut scratch = Scratch::new(days);
                     let mut rows: Vec<UserRow> = Vec::new();
-                    let mut bucket_events: Vec<Event> = Vec::new();
-                    let mut bucket_clicks: Vec<Click> = Vec::new();
                     loop {
                         let b = next.fetch_add(1, Ordering::Relaxed);
                         if b >= buckets.len() {
@@ -121,15 +119,7 @@ fn run() -> Result<(), Fail> {
                         let Some((event_parts, click_parts)) = buckets[b].lock().unwrap().take() else {
                             continue;
                         };
-                        bucket_events.clear();
-                        for part in event_parts {
-                            bucket_events.extend_from_slice(&part);
-                        }
-                        bucket_clicks.clear();
-                        for part in click_parts {
-                            bucket_clicks.extend_from_slice(&part);
-                        }
-                        sessions::run_bucket(&mut bucket_events, &mut bucket_clicks, rules, &mut scratch, &mut rows, &mut accum);
+                        sessions::run_bucket(&event_parts, &click_parts, rules, &mut scratch, &mut rows, &mut accum);
                     }
                     let computed = started.elapsed().as_secs_f64();
                     if thread == 0 || !rows.is_empty() {
