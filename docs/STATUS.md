@@ -1,10 +1,11 @@
 # Status
 
-Updated 2026-11-21 10:50 UTC.
+Updated 2026-11-21 10:53 UTC.
 
 | Item | Value |
 |---|---|
 | Best practice score | 0.92 s (commit a67654b, faster event dedup and click filing; entered in the final) |
+| Final-scale check | a67654b on 60M generated events: exit 0, peak working set 8.41 GiB, both tables identical to the 0.96 s build's output |
 | Board leader | 0.36 s |
 | Target (leader minus 10 percent) | 0.324 s |
 | Main | solver code of a67654b (parse stage redesign, the sessions and output rewrite and the faster dedup and click filing, no code comments); the opt/memexit changes are not in it, since they scored the same 1.04 s |
