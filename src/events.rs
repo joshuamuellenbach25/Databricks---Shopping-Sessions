@@ -93,6 +93,23 @@ impl Sale {
 
 const _: () = assert!(std::mem::size_of::<Raw>() == 32);
 const _: () = assert!(std::mem::size_of::<Event>() == 16);
+// `recycle` reuses a raw buffer as an event buffer: the layouts must match.
+const _: () = assert!(std::mem::size_of::<Raw>() == 2 * std::mem::size_of::<Event>());
+const _: () = assert!(std::mem::align_of::<Raw>() == std::mem::align_of::<Event>());
+
+/// Turns a processed raw buffer into an empty event buffer over the same
+/// allocation, twice the capacity, so dedup writes its output into pages that
+/// parse already touched instead of faulting in new ones.
+fn recycle(mut raws: Vec<Raw>) -> Vec<Event> {
+    raws.clear();
+    let mut raws = std::mem::ManuallyDrop::new(raws);
+    let capacity = raws.capacity();
+    // SAFETY: the allocation holds `capacity` Raws of 32 bytes at alignment 8,
+    // which is `2 * capacity` Events of 16 bytes at the same alignment (the
+    // asserts above), so the layout given back on drop is the one allocated.
+    // The length is 0 and both types are Copy, so nothing is read or dropped.
+    unsafe { Vec::from_raw_parts(raws.as_mut_ptr().cast::<Event>(), 0, 2 * capacity) }
+}
 
 /// Refuses a dataset whose times or categories do not fit the records. Times
 /// are i32 milliseconds from the window start; clicks reach 7 days before the
@@ -197,13 +214,15 @@ pub fn parse(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Resul
 /// Dedups on event_id (smallest ingest wins, before validation), keeps the
 /// valid, not-late events and returns them bucketed by person. Each thread
 /// writes a person bucket's events into chunks sized from the raw count: no
-/// output vector is ever reallocated, and chunks are allocated as dedup
-/// advances, while the processed raw records are being freed.
+/// output vector is ever reallocated. A chunk reuses a raw buffer the thread
+/// has finished with when one is spare, else is allocated as dedup advances.
 pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> {
     /// Chunks each thread fills per person bucket when events spread evenly.
     const CHUNKS_PER_PART: usize = 8;
     /// Smallest chunk, in events.
     const MIN_CHUNK: usize = 64;
+    /// Most recycled raw buffers a thread holds for later chunks; the rest are freed.
+    const MAX_SPARE: usize = 64;
     let by_bucket: Vec<Mutex<Vec<Vec<Raw>>>> = (0..EVENT_BUCKETS).map(|_| Mutex::new(Vec::with_capacity(parsed.len()))).collect();
     let mut raw_total = 0;
     for state in parsed {
@@ -222,6 +241,8 @@ pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> 
                     let mut full: Vec<Vec<Vec<Event>>> = (0..PERSON_BUCKETS).map(|_| Vec::new()).collect();
                     let mut kept: HashMap<Key, (i64, u32, u32)> = HashMap::new();
                     let mut survivors: Vec<(u32, u32)> = Vec::new();
+                    // Processed raw buffers, recycled as output chunks.
+                    let mut spare: Vec<Vec<Event>> = Vec::with_capacity(MAX_SPARE);
                     loop {
                         let b = next.fetch_add(1, Ordering::Relaxed);
                         if b >= EVENT_BUCKETS {
@@ -256,12 +277,18 @@ pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> 
                             let bucket = person.bucket(PERSON_BITS);
                             let current = &mut open[bucket];
                             if current.len() == current.capacity() {
-                                let filled = std::mem::replace(current, Vec::with_capacity(chunk));
+                                let fresh = spare.pop().unwrap_or_else(|| Vec::with_capacity(chunk));
+                                let filled = std::mem::replace(current, fresh);
                                 if !filled.is_empty() {
                                     full[bucket].push(filled);
                                 }
                             }
                             current.push(Event { person, ts: raw.ts, sale: raw.sale });
+                        }
+                        for part in parts {
+                            if spare.len() < MAX_SPARE && 2 * part.capacity() >= chunk {
+                                spare.push(recycle(part));
+                            }
                         }
                     }
                     for (bucket, current) in open.into_iter().enumerate() {
