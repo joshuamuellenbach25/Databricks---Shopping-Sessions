@@ -1,10 +1,13 @@
 use std::path::PathBuf;
 
-use crate::events::{transpose, Buckets, CHUNK, PERSON_BITS, PERSON_BUCKETS, PREFETCH_AHEAD};
+use crate::events::{transpose, Buckets, PERSON_BITS, PERSON_BUCKETS, PREFETCH_AHEAD};
 use crate::ids::Key;
 use crate::lookups::{Campaigns, Window};
 use crate::people::People;
-use crate::timestamp::{self, WEEK};
+use crate::timestamp::{self, DAY, WEEK};
+
+const CLICK_CHUNK: usize = 512 << 10;
+const BATCH: usize = 256;
 
 #[derive(Clone, Copy)]
 pub struct Click {
@@ -16,19 +19,17 @@ pub struct Click {
 
 const _: () = assert!(std::mem::size_of::<Click>() == 24);
 
-const EMPTY: Click = Click { person: Key(0), id: Key(0), ts: 0, campaign: 0 };
-
 pub struct Context<'a> {
     pub window: Window,
     pub campaigns: &'a Campaigns,
     pub people: &'a People,
 }
 
-fn parse_click(fields: &[&[u8]; 4], ctx: &Context) -> Option<Click> {
+fn parse_click(fields: &[&[u8]; 4], ctx: &Context, dates: &timestamp::Months) -> Option<Click> {
     if fields[0].is_empty() || fields[1].is_empty() {
         return None;
     }
-    let ts = timestamp::parse(fields[3])?;
+    let ts = dates.parse(fields[3])?;
     if ts < ctx.window.start - WEEK || ts >= ctx.window.end {
         return None;
     }
@@ -43,38 +44,43 @@ fn parse_click(fields: &[&[u8]; 4], ctx: &Context) -> Option<Click> {
 
 struct Filed {
     buckets: Vec<Vec<Click>>,
-    ring: [Click; PREFETCH_AHEAD],
-    parsed: usize,
+    batch: Vec<Click>,
+    linked: Vec<u32>,
 }
 
 impl Filed {
     fn new(per_bucket: usize) -> Filed {
-        Filed { buckets: (0..PERSON_BUCKETS).map(|_| Vec::with_capacity(per_bucket)).collect(), ring: [EMPTY; PREFETCH_AHEAD], parsed: 0 }
-    }
-
-    #[inline(always)]
-    fn file(&mut self, mut click: Click, people: &People) {
-        click.person = people.name_of(click.person);
-        self.buckets[click.person.bucket(PERSON_BITS)].push(click);
+        Filed { buckets: (0..PERSON_BUCKETS).map(|_| Vec::with_capacity(per_bucket)).collect(), batch: Vec::with_capacity(BATCH), linked: vec![0; BATCH] }
     }
 
     #[inline(always)]
     fn take(&mut self, click: Click, people: &People) {
-        people.prefetch(click.person);
-        let slot = self.parsed % PREFETCH_AHEAD;
-        if self.parsed >= PREFETCH_AHEAD {
-            let ready = self.ring[slot];
-            self.file(ready, people);
+        self.batch.push(click);
+        if self.batch.len() == BATCH {
+            self.flush(people);
         }
-        self.ring[slot] = click;
-        self.parsed += 1;
+    }
+
+    fn flush(&mut self, people: &People) {
+        let mut m = 0;
+        for (j, click) in self.batch.iter().enumerate() {
+            self.linked[m] = j as u32;
+            m += usize::from(people.may_be_linked(click.person));
+        }
+        for t in 0..m {
+            if let Some(&ahead) = self.linked[..m].get(t + PREFETCH_AHEAD) {
+                people.prefetch_slot(self.batch[ahead as usize].person);
+            }
+            let j = self.linked[t] as usize;
+            self.batch[j].person = people.linked_name(self.batch[j].person);
+        }
+        for click in self.batch.drain(..) {
+            self.buckets[click.person.bucket(PERSON_BITS)].push(click);
+        }
     }
 
     fn finish(mut self, people: &People) -> Vec<Vec<Click>> {
-        for n in self.parsed.saturating_sub(PREFETCH_AHEAD)..self.parsed {
-            let click = self.ring[n % PREFETCH_AHEAD];
-            self.file(click, people);
-        }
+        self.flush(people);
         self.buckets
     }
 }
@@ -83,13 +89,14 @@ pub fn collect(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Res
     let bytes = crate::scan::total_size(paths)? as usize;
     let per_bucket = bytes / 45 / threads / PERSON_BUCKETS + 16;
     let people = ctx.people;
+    let dates = timestamp::Months::new((ctx.window.start - WEEK).div_euclid(DAY) - 1, (ctx.window.end - 1).div_euclid(DAY) + 1);
     let states = crate::scan::run_fields::<4, _, _, _>(
         paths,
         threads,
-        CHUNK,
+        CLICK_CHUNK,
         || Filed::new(per_bucket),
         |state, fields| {
-            if let Some(click) = parse_click(fields, ctx) {
+            if let Some(click) = parse_click(fields, ctx, &dates) {
                 state.take(click, people);
             }
         },
@@ -151,7 +158,7 @@ mod tests {
         let people = People::build(pairs, 50);
         let ctx = Context { window, campaigns: &campaigns, people: &people };
         let mut everything = Vec::new();
-        for (file, count) in [0, 1, PREFETCH_AHEAD - 1, PREFETCH_AHEAD, PREFETCH_AHEAD + 1, 300].into_iter().enumerate() {
+        for (file, count) in [0, 1, BATCH - 1, BATCH, BATCH + 1, 300].into_iter().enumerate() {
             let mut expected = write_clicks(&dir, file, count, window);
             expected.sort();
             assert_eq!(filed(&[dir.join(format!("part-{file}.csv"))], 1, &ctx), expected, "{count} clicks");
