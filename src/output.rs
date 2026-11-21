@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -15,7 +16,6 @@ use crate::sessions::{Accum, UserRows};
 
 type Fail = Box<dyn std::error::Error + Send + Sync>;
 
-/// `sessions::check_counts` keeps sessions and events within int32.
 const USER_DAILY: &str = "message user_daily {
     required binary user_id (UTF8);
     required int32 day (DATE);
@@ -50,26 +50,18 @@ fn writer(file: File, schema: &str) -> Result<SerializedFileWriter<File>, Fail> 
     Ok(SerializedFileWriter::new(file, schema, props)?)
 }
 
-/// Bytes kept until the process exits. The solver exits right after writing
-/// its output, so a string value kept here once is shared by every row that
-/// writes it as a plain slice, with no allocation or reference count per row.
 fn lasting(bytes: Vec<u8>) -> &'static [u8] {
     bytes.leak()
 }
 
-/// A string value over lasting bytes.
 #[inline]
 fn value(bytes: &'static [u8]) -> ByteArray {
     ByteArray::from(Bytes::from_static(bytes))
 }
 
-/// One thread's user_daily file, written a row group at a time. A file
-/// closed without row groups is still a valid, empty table part.
 pub struct UserDaily {
     file: SerializedFileWriter<File>,
-    /// Each category's name, lasting.
     names: Vec<&'static [u8]>,
-    /// The values of a string column, reused across row groups.
     values: Vec<ByteArray>,
 }
 
@@ -79,11 +71,8 @@ impl UserDaily {
         Ok(UserDaily { file: writer(file, USER_DAILY)?, names, values: Vec::new() })
     }
 
-    /// Writes `rows` as one row group.
     pub fn write(&mut self, rows: &UserRows) -> Result<(), Fail> {
         let mut group = self.file.next_row_group()?;
-        // Each person's ID spelled once, under one read of the intern table,
-        // into one lasting buffer; all of the person's rows share its slice.
         let mut text = Vec::with_capacity(rows.persons.len() * 10);
         let mut ends = Vec::with_capacity(rows.persons.len());
         let spelling = ids::spelling();
@@ -118,7 +107,6 @@ impl UserDaily {
     }
 }
 
-/// Writes the campaign_daily rows of the campaigns numbered in `share`.
 pub fn write_campaign_daily(file: File, accum: &Accum, campaigns: &Campaigns, share: Range<usize>, base_day: i32) -> Result<(), Fail> {
     let mut ids = Vec::new();
     let mut channels = Vec::new();
@@ -150,6 +138,35 @@ pub fn write_campaign_daily(file: File, accum: &Accum, campaigns: &Campaigns, sh
     }
     group.close()?;
     file.close()?;
+    Ok(())
+}
+
+pub fn staged_name(part: usize) -> String {
+    format!(".part-{part:03}.parquet.tmp")
+}
+
+fn part_name(part: usize) -> String {
+    format!("part-{part:03}.parquet")
+}
+
+fn solver_part(name: &str) -> Option<usize> {
+    let part = name.trim_start_matches('.').strip_prefix("part-")?.split('.').next()?.parse().ok()?;
+    (name == part_name(part) || name == staged_name(part)).then_some(part)
+}
+
+pub fn publish(dir: &Path, parts: usize) -> Result<(), String> {
+    let fail = |path: &Path, e: std::io::Error| format!("{}: {e}", path.display());
+    for part in 0..parts {
+        let staged = dir.join(staged_name(part));
+        std::fs::rename(&staged, dir.join(part_name(part))).map_err(|e| fail(&staged, e))?;
+    }
+    for entry in std::fs::read_dir(dir).map_err(|e| fail(dir, e))? {
+        let entry = entry.map_err(|e| fail(dir, e))?;
+        let surplus = entry.file_name().to_str().and_then(solver_part).is_some_and(|part| part >= parts);
+        if surplus && entry.file_type().map_err(|e| fail(&entry.path(), e))?.is_file() {
+            std::fs::remove_file(entry.path()).map_err(|e| fail(&entry.path(), e))?;
+        }
+    }
     Ok(())
 }
 

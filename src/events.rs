@@ -90,7 +90,6 @@ impl Sale {
         (self.0 >> PRICE_BITS) as u16
     }
 
-    /// The word `from_bits` turns back into this sale.
     #[inline]
     pub fn to_bits(self) -> u32 {
         self.0

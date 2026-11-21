@@ -26,7 +26,6 @@ use sessions::{Accum, Counts, Rules, Scratch, UserRows};
 
 type Fail = Box<dyn std::error::Error + Send + Sync>;
 
-/// Rows a sessions thread gathers before writing them as a row group.
 const ROW_GROUP_ROWS: usize = 1 << 14;
 
 #[global_allocator]
@@ -85,12 +84,8 @@ fn run() -> Result<(), Fail> {
     let campaign_dir = out.join("campaign_daily");
     std::fs::create_dir_all(&user_dir)?;
     std::fs::create_dir_all(&campaign_dir)?;
-    // Every output file is created now, beside the reading, since creating a
-    // file can take milliseconds; the sessions phase only writes them. Each
-    // sessions thread writes one user_daily part, and as many threads then
-    // write one campaign_daily part each.
-    let user_paths: Vec<PathBuf> = (0..threads).map(|part| user_dir.join(format!("part-{part:03}.parquet"))).collect();
-    let campaign_paths: Vec<PathBuf> = (0..threads).map(|part| campaign_dir.join(format!("part-{part:03}.parquet"))).collect();
+    let user_paths: Vec<PathBuf> = (0..threads).map(|part| user_dir.join(output::staged_name(part))).collect();
+    let campaign_paths: Vec<PathBuf> = (0..threads).map(|part| campaign_dir.join(output::staged_name(part))).collect();
     let creating = {
         let paths: Vec<PathBuf> = user_paths.iter().chain(&campaign_paths).cloned().collect();
         std::thread::spawn(move || -> Result<Vec<File>, String> { paths.iter().map(|path| File::create(path).map_err(|e| format!("{}: {e}", path.display()))).collect() })
@@ -130,7 +125,6 @@ fn run() -> Result<(), Fail> {
     let base_day = timestamp::day_of(window.start);
     let days = (timestamp::day_of(window.end - 1) - base_day + 1) as usize;
     let rules = Rules { origin: window.start, base_day, products: &products };
-    // Largest buckets first, so that no thread takes a large one last.
     let mut order: Vec<(usize, usize)> = event_buckets.iter().enumerate().map(|(b, parts)| (parts.iter().map(Vec::len).sum(), b)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let mut click_buckets = click_buckets.into_iter();
@@ -155,12 +149,9 @@ fn run() -> Result<(), Fail> {
                     let mut counts = Counts::new(campaigns.ids.len(), days);
                     let mut scratch = Scratch::new(campaigns.ids.len(), days);
                     let mut rows = UserRows::with_capacity(2 * ROW_GROUP_ROWS);
-                    // Every thread finishes its file, with or without rows.
                     let file = file.ok_or_else(|| format!("{}: not created", path.display()))?;
                     let mut file = UserDaily::create(file, &products.categories).map_err(fail)?;
                     let mut written = 0f64;
-                    // Rows go out a row group at a time between buckets, so
-                    // the threads share the writing as they share the buckets.
                     let mut flush = |rows: &mut UserRows, file: &mut UserDaily| -> Result<(), String> {
                         let begun = Instant::now();
                         file.write(rows).map_err(fail)?;
@@ -180,9 +171,6 @@ fn run() -> Result<(), Fail> {
                             flush(&mut rows, &mut file)?;
                         }
                     }
-                    // The main thread merges every thread's counts and has
-                    // campaign_daily written while the threads write their
-                    // last rows.
                     sender.send(counts).map_err(|_| "the campaign_daily writer stopped before taking a thread's counts".to_string())?;
                     if !rows.is_empty() {
                         flush(&mut rows, &mut file)?;
@@ -206,7 +194,6 @@ fn run() -> Result<(), Fail> {
         }
         let total = Arc::new(total);
         let campaign_written: Result<(), String> = if merged == threads {
-            // One part per file, each a share of the campaigns, all written at once.
             let parts = campaign_files.len();
             let writers: Vec<_> = campaign_files
                 .into_iter()
@@ -233,6 +220,8 @@ fn run() -> Result<(), Fail> {
         sort_max = sort_max.max(sorted);
     }
     campaign_written?;
+    output::publish(&user_dir, threads)?;
+    output::publish(&campaign_dir, threads)?;
     eprintln!("  sessions compute max {compute_max:.3} s (sort max {sort_max:.3} s), user_daily write max {write_max:.3} s");
     phase("sessions and output");
     let sessions_total: i64 = total.cells.iter().map(|c| c.sessions).sum();

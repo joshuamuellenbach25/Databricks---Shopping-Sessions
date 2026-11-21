@@ -10,9 +10,6 @@ use crate::timestamp;
 const GAP: i32 = (30 * timestamp::MINUTE) as i32;
 const WEEK: i32 = timestamp::WEEK as i32;
 
-/// Refuses more surviving events than the counts here hold. No session,
-/// event or assist count can exceed the surviving events; user_daily writes
-/// its counts as int32 and each thread counts per (campaign, day) in u32.
 pub fn check_counts(events: usize) -> Result<(), String> {
     if events > i32::MAX as usize {
         return Err(format!("{events} surviving events; session and event counts are stored as int32, which holds at most {}", i32::MAX));
@@ -20,20 +17,15 @@ pub fn check_counts(events: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// One thread's user_daily rows, column by column as the writer takes them.
 #[derive(Default)]
 pub struct UserRows {
-    /// Each person with rows and how many rows it has, in row order: a
-    /// person's rows are consecutive.
     pub persons: Vec<(Key, u32)>,
     /// Days since the epoch.
     pub days: Vec<i32>,
     pub sessions: Vec<i32>,
     pub events: Vec<i32>,
     pub revenue: Vec<i64>,
-    /// 1 for a row with a top category, 0 for a row without one.
     pub has_top: Vec<i16>,
-    /// The top category of each row that has one, in row order.
     pub tops: Vec<u16>,
 }
 
@@ -69,8 +61,6 @@ impl UserRows {
     }
 }
 
-/// One thread's totals per (campaign, day), each at `campaign * days + day`;
-/// campaign 0 is `organic`. `check_counts` keeps every count within u32.
 pub struct Counts {
     days: usize,
     sessions: Vec<u32>,
@@ -99,7 +89,6 @@ pub struct Cell {
     pub assisted: i64,
 }
 
-/// Per (campaign, day) totals of every thread; campaign 0 is `organic`.
 pub struct Accum {
     pub days: usize,
     pub cells: Vec<Cell>,
@@ -145,11 +134,6 @@ struct Session {
     revenue: i64,
 }
 
-/// The events of one person inside one `GAP`-long stretch of time. Any two
-/// events of a slot are less than `GAP` apart, so a slot never splits
-/// across sessions, and a session break can only fall between occupied
-/// slots: two that are not neighbours, or neighbours whose facing times are
-/// more than `GAP` apart.
 #[derive(Clone, Copy)]
 struct Slot {
     first: u32,
@@ -179,27 +163,16 @@ pub struct Scratch {
 
 /// Scratch space reused across persons.
 struct PersonScratch {
-    /// Every slot of the window, the time from the window start divided by
-    /// `GAP`; all empty between persons.
     slots: Vec<Slot>,
-    /// One bit per slot, set for the slots the current person occupies, so
-    /// they are read back in time order without a sort.
     occupied: Vec<u64>,
     sessions: Vec<Session>,
     day_agg: Vec<DayAgg>,
     used_days: Vec<usize>,
     day_lo: Vec<usize>,
-    /// Per campaign, the end of the sessions its clicks assist so far; 0
-    /// for a campaign none of the person's clicks has assisted yet.
     covered: Vec<u32>,
-    /// Per campaign, the set of a person's sessions its clicks assist, for
-    /// a person with at most 64 sessions.
     assist_bits: Vec<u64>,
-    /// For such a person, the set of its sessions on each of its days, and
-    /// per session the place of its day among those.
     day_bits: Vec<u64>,
     day_rank: Vec<u8>,
-    /// The campaigns whose `covered` or `assist_bits` is not 0.
     touched: Vec<u16>,
 }
 
@@ -207,23 +180,15 @@ struct PersonScratch {
 #[derive(Default)]
 struct GroupScratch {
     persons: Persons,
-    /// Person number of each event, in reading order.
     event_tag: Vec<u32>,
-    /// Start of each person's event times, purchases and clicks, plus the total.
     event_off: Vec<u32>,
     purchase_off: Vec<u32>,
     click_off: Vec<u32>,
     fill: Vec<u32>,
     purchase_fill: Vec<u32>,
-    /// The time of every event, never negative.
     times: Vec<u32>,
-    /// Each purchase as `pack` gives it.
     purchases: Vec<u64>,
-    /// Person number of each click, in reading order; `NO_GROUP` for the
-    /// click of a person without events.
     click_tag: Vec<u32>,
-    /// The clicks of persons with events, person by person, each person's
-    /// in (ts, click_id) order.
     clicks: Vec<Click>,
 }
 
@@ -231,8 +196,6 @@ const NO_GROUP: u32 = u32::MAX;
 
 impl Scratch {
     pub fn new(campaigns: usize, days: usize) -> Scratch {
-        // An event time is under `days` whole days from the window start,
-        // since the window starts and ends inside those days.
         let slots = days * (timestamp::DAY as usize).div_ceil(GAP as usize);
         Scratch {
             sort_seconds: 0.0,
@@ -254,26 +217,19 @@ impl Scratch {
     }
 }
 
-/// The persons of one bucket numbered in order of first appearance, in an
-/// open-addressing table kept at most half full. A position holds its
-/// person's number plus one, so 0 marks an empty position whatever the key.
 #[derive(Default)]
 struct Persons {
     keys: Vec<u64>,
     numbers: Vec<u32>,
     shift: u32,
-    /// The person and the table position of each number.
     list: Vec<Key>,
     positions: Vec<u32>,
 }
 
-/// Multiplier of the table's hash. `Key::bucket` uses another, since every
-/// key of a bucket shares the top bits of that one's product.
 const PERSON_MIX: u64 = 0xFF51_AFD7_ED55_8CCD;
 const MIN_POSITIONS: usize = 64;
 
 impl Persons {
-    /// Empties the table, keeping its size.
     fn clear(&mut self) {
         if self.numbers.is_empty() {
             self.resize(MIN_POSITIONS);
@@ -291,13 +247,11 @@ impl Persons {
         self.shift = 64 - positions.trailing_zeros();
     }
 
-    /// Where the search for `key` starts.
     #[inline(always)]
     fn home(&self, key: Key) -> usize {
         (key.0.wrapping_mul(PERSON_MIX) >> self.shift) as usize
     }
 
-    /// The number of `key`, giving it the next number when it is new.
     #[inline(always)]
     fn number(&mut self, key: Key) -> usize {
         let mask = self.numbers.len() - 1;
@@ -314,7 +268,6 @@ impl Persons {
         }
     }
 
-    /// The number of `key`, or None when it is not in the table.
     #[inline(always)]
     fn find(&self, key: Key) -> Option<usize> {
         let mask = self.numbers.len() - 1;
@@ -331,8 +284,6 @@ impl Persons {
         }
     }
 
-    /// Numbers the new person `key` at the empty `position`, doubling the
-    /// table first when the person would fill more than half of it.
     fn insert(&mut self, mut position: usize, key: Key) -> usize {
         if 2 * (self.list.len() + 1) > self.numbers.len() {
             self.resize(2 * self.numbers.len());
@@ -361,8 +312,6 @@ impl Persons {
     }
 }
 
-/// A purchase as one word: its time, never negative, in the high 32 bits
-/// and its sale in the low 32.
 #[inline(always)]
 fn pack(event: &Event) -> u64 {
     (u64::from(event.ts as u32) << 32) | u64::from(event.sale.to_bits())
@@ -444,9 +393,6 @@ pub fn run_bucket(event_parts: &[Vec<Event>], click_parts: &[Vec<Click>], rules:
         }
     }
 
-    // The clicks of persons with events, spread person by person. A person
-    // with few clicks gets each one inserted in (ts, click_id) order as it
-    // lands; one with many has its clicks sorted afterwards.
     g.click_tag.clear();
     g.click_off.clear();
     g.click_off.resize(groups, 0);
@@ -506,41 +452,27 @@ pub fn run_bucket(event_parts: &[Vec<Event>], click_parts: &[Vec<Click>], rules:
     }
 }
 
-/// A person's clicks are inserted in order while being spread when there
-/// are this many or fewer, and sorted afterwards when there are more.
 const INSERTED_CLICKS: usize = 32;
 
-/// Clicks by time, then by click_id compared byte by byte.
 #[inline(always)]
 fn click_order(a: &Click, b: &Click) -> std::cmp::Ordering {
     a.ts.cmp(&b.ts).then_with(|| a.id.cmp_bytes(b.id))
 }
 
-/// A click's newly assisted sessions are counted session by session when
-/// there are this many or fewer, else day by day.
 const SHORT_RUN: usize = 16;
 
-/// The slot holding the event time `t`.
 #[inline(always)]
 fn slot_of(t: u32) -> usize {
     (t / GAP as u32) as usize
 }
 
-/// Bits `lo` up to but not including `hi` of a word, for `lo < hi <= 64`.
 #[inline(always)]
 fn range_bits(lo: usize, hi: usize) -> u64 {
     (u64::MAX >> (64 - hi)) & (u64::MAX << lo)
 }
 
-/// One person's sessions, credits, assists and user_daily rows, from its
-/// event times and its purchases, in any order, and its clicks in time
-/// order with the smallest click_id first at each shared time.
 #[allow(clippy::too_many_arguments)]
 fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], rules: &Rules, scratch: &mut PersonScratch, rows: &mut UserRows, counts: &mut Counts) {
-    // Sessions from slots: the first and last time and the event count of
-    // each occupied slot, then the occupied slots in order, a new session
-    // starting at each break. An empty slot is `Slot::EMPTY`, so filling
-    // one needs no test.
     for &t in times {
         let s = slot_of(t);
         let slot = &mut scratch.slots[s];
@@ -566,7 +498,6 @@ fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], 
             previous = Some((s, slot.last));
         }
     }
-    // A purchase belongs to the last session starting at or before it.
     for &p in purchases {
         let sale = sale(p);
         let price = i64::from(sale.price());
@@ -580,9 +511,6 @@ fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], 
         }
     }
 
-    // Clicks before `seen` are at or before the current session start, which
-    // only grows; `run` is the first of them at the latest of their times,
-    // so the one with the smallest click_id at that time.
     let mut seen = 0;
     let mut run = 0;
     for session in &scratch.sessions {
@@ -609,13 +537,8 @@ fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], 
         }
     }
 
-    // A click assists the sessions that start in [ts, ts + WEEK], a range
-    // [lo, hi) of them that only moves forward as the clicks come in time
-    // order. A campaign assists a session once.
     let sessions = &scratch.sessions;
     if !clicks.is_empty() && sessions.len() <= 64 {
-        // Each campaign's assisted sessions as one bit set, the union of its
-        // clicks' ranges, then counted day by day.
         let (mut lo, mut hi) = (0, 0);
         for click in clicks {
             let ts = click.ts;
@@ -633,8 +556,6 @@ fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], 
                 *bits |= range_bits(lo, hi);
             }
         }
-        // The sessions of each of the person's days, in `used_days` order,
-        // and the place in that order of each session's day.
         scratch.day_bits.clear();
         scratch.day_rank.clear();
         for (i, session) in sessions.iter().enumerate() {
@@ -644,7 +565,6 @@ fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], 
             *scratch.day_bits.last_mut().unwrap() |= 1 << i;
             scratch.day_rank.push(scratch.day_bits.len() as u8 - 1);
         }
-        // Each campaign's sessions, day by day over the days it assists.
         for &campaign in &scratch.touched {
             let mut bits = std::mem::take(&mut scratch.assist_bits[usize::from(campaign)]);
             while bits != 0 {
@@ -657,10 +577,7 @@ fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], 
         }
         scratch.touched.clear();
     } else if !clicks.is_empty() {
-        // Too many sessions for a bit set: `covered` holds the end of each
-        // campaign's ranges so far, and only a range's part past it counts.
         let (mut lo, mut hi) = (0, 0);
-        // Filled when a long range first needs it.
         let mut day_lo_filled = false;
         for click in clicks {
             let ts = click.ts;
@@ -696,8 +613,6 @@ fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], 
                 counts.assisted[cell] += n;
             } else {
                 if !day_lo_filled {
-                    // Sessions sort by start, so by day: day_lo[d] is the
-                    // first session on day d or later.
                     let (first_day, last_day) = (sessions[0].day, sessions[sessions.len() - 1].day);
                     let mut i = 0;
                     for d in first_day..=last_day + 1 {
@@ -737,7 +652,6 @@ fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], 
                 best = sum;
             }
         }
-        // `check_counts` keeps both counts within i32.
         rows.days.push(rules.base_day + day as i32);
         rows.sessions.push(agg.sessions as i32);
         rows.events.push(agg.events as i32);
@@ -834,9 +748,6 @@ mod tests {
         let rules = Rules { origin, base_day, products: &products };
         let u1 = Key::from_bytes(b"u1");
         let at = |ts: i32| Event { person: u1, ts, sale: Sale::NONE };
-        // Slots 0 and 1, exactly GAP apart: one session. Slot 3: a break, the
-        // slots not being neighbours. Slot 4, a neighbour more than GAP after
-        // slot 3's time: a break. Slot 5, exactly GAP after slot 4, twice: joins.
         let events = vec![at(6 * GAP - 1), at(GAP - 1), at(3 * GAP), at(2 * GAP - 1), at(5 * GAP - 1), at(6 * GAP - 1)];
         let mut scratch = Scratch::new(1, days);
         let mut rows = UserRows::default();
@@ -863,12 +774,10 @@ mod tests {
         let (few, many) = (Key::from_bytes(b"u1"), Key::from_bytes(b"u2"));
         let events = vec![Event { person: few, ts: start, sale: Sale::NONE }, Event { person: many, ts: start, sale: Sale::NONE }];
         let click = |person: Key, id: &str, ts: i32, campaign: u16| Click { person, id: Key::from_bytes(id.as_bytes()), ts, campaign };
-        // Long IDs compare through their bytes: "k-2" sorts before "k1" and "kz".
         let mut clicks = Vec::new();
         for person in [few, many] {
             clicks.extend([click(person, "kz", start - 10, 1), click(person, "k1", start - 10, 4), click(person, "k-2", start - 10, 3), click(person, "k0", start - 20, 2)]);
         }
-        // Enough older clicks that the second person's are sorted, not inserted.
         clicks.extend((0..2 * INSERTED_CLICKS as i32).map(|i| click(many, &format!("m{i}"), start - 1000 - i, 2)));
         clicks.reverse();
         let mut scratch = Scratch::new(5, days);
@@ -903,13 +812,6 @@ mod tests {
         }
     }
 
-    /// Persons with every rule's edge: equal times, gaps of exactly 30
-    /// minutes and one millisecond more, sessions crossing midnight, ties in
-    /// the top category, clicks at the session start, exactly a week before
-    /// it and a millisecond more, distinct clicks at one millisecond, copies
-    /// of a click, long click IDs, clicks of persons without events, and one
-    /// person with enough events for the radix sort. Every time stays inside
-    /// a 14-day window, clicks reaching 7 days before it.
     fn dataset(seed: u64, base: i32) -> (Vec<Event>, Vec<Click>) {
         let mut x = seed;
         let mut next = move |n: u64| {
@@ -965,7 +867,6 @@ mod tests {
         clicks.retain(|c| c.ts >= -WEEK && c.ts < end);
         assert!(events.iter().filter(|e| e.person == Key::from_bytes(b"u0")).count() >= 512);
         assert!(clicks.iter().filter(|c| c.person == Key::from_bytes(b"u0")).count() > INSERTED_CLICKS);
-        // Shuffle so persons interleave as dedup leaves them.
         for i in (1..events.len()).rev() {
             events.swap(i, next(i as u64 + 1) as usize);
         }
@@ -975,7 +876,6 @@ mod tests {
         (events, clicks)
     }
 
-    /// The rules applied one session and one click at a time.
     fn reference(events: &[Event], clicks: &[Click], rules: &Rules, campaigns: usize, days: usize) -> (Vec<Row>, Vec<(i64, i64, i64, i64)>) {
         let mut cells = vec![(0i64, 0i64, 0i64, 0i64); campaigns * days];
         let mut by_person: HashMap<Key, Vec<i32>> = HashMap::new();
@@ -1015,7 +915,6 @@ mod tests {
                 for (cat, sum) in cats {
                     *entry.3.entry(cat).or_insert(0) += sum;
                 }
-                // The latest qualifying click, and of those the smallest click_id.
                 let mut best: Option<&Click> = None;
                 for &c in mine.iter().filter(|c| c.ts <= start && start - c.ts <= WEEK) {
                     if best.is_none_or(|b| c.ts > b.ts || (c.ts == b.ts && c.id.to_vec() < b.id.to_vec())) {
@@ -1059,15 +958,12 @@ mod tests {
             ties += clicks.iter().enumerate().filter(|&(i, a)| clicks[..i].iter().any(|b| b.person == a.person && b.ts == a.ts && b.id != a.id)).count();
             let (want_rows, want_cells) = reference(&events, &clicks, &rules, campaigns, days);
             assert!(want_cells.iter().any(|c| c.3 > 0) && want_cells.iter().any(|c| c.1 > 0), "seed {seed}");
-            // One person has too many sessions for the bit-set assists.
             assert!(want_rows.iter().filter(|r| r.0 == b"u0").map(|r| r.2).sum::<i64>() > 64, "seed {seed}");
-            // The bucket as dedup and the click scan leave it: several parts each.
             let event_parts: Vec<Vec<Event>> = events.chunks(events.len() / 3 + 1).map(<[Event]>::to_vec).collect();
             let click_parts: Vec<Vec<Click>> = clicks.chunks(clicks.len() / 4 + 1).map(<[Click]>::to_vec).collect();
             let mut scratch = Scratch::new(campaigns, days);
             let mut rows = UserRows::default();
             let mut counts = Counts::new(campaigns, days);
-            // Twice through one scratch, as a thread runs bucket after bucket.
             run_bucket(&event_parts, &click_parts, &rules, &mut scratch, &mut rows, &mut counts);
             assert_eq!(user_rows(&rows), want_rows, "seed {seed}");
             assert_eq!(cells(&counts, campaigns, days), want_cells, "seed {seed}");
