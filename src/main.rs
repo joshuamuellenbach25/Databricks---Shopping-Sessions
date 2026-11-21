@@ -73,6 +73,17 @@ fn run() -> Result<(), Fail> {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, usize::from));
 
     let window = lookups::read_manifest(&data)?;
+    // The links come first, so the person table builds while this thread
+    // reads the lookups: its workers use the CPUs this thread leaves idle and
+    // are done before the events parse needs every CPU.
+    let link_pairs = links::collect(&scan::csv_files(&data.join("links"))?, threads)?;
+    let builder = std::thread::spawn(move || {
+        let started = Instant::now();
+        let expected: usize = link_pairs.iter().map(Vec::len).sum();
+        let people = People::build(&link_pairs, threads.saturating_sub(1).max(1));
+        eprintln!("  people: {expected} links in {:.3} s", started.elapsed().as_secs_f64());
+        people
+    });
     let products = lookups::read_products(&data)?;
     events::check_fits(window, &products)?;
     let campaigns = lookups::read_campaigns(&data)?;
@@ -80,24 +91,13 @@ fn run() -> Result<(), Fail> {
     let campaign_dir = out.join("campaign_daily");
     std::fs::create_dir_all(&user_dir)?;
     std::fs::create_dir_all(&campaign_dir)?;
-    let link_pairs = links::collect(&scan::csv_files(&data.join("links"))?, threads)?;
     let event_files = scan::csv_files(&data.join("events"))?;
     let click_files = scan::csv_files(&data.join("clicks"))?;
     phase("lookups and links");
 
     let event_ctx = events::Context { window, products: &products };
-    let (people, parsed) = std::thread::scope(|scope| {
-        let builder = scope.spawn(|| {
-            let started = Instant::now();
-            let expected = link_pairs.iter().map(Vec::len).sum();
-            let people = People::build(link_pairs.into_iter().flatten(), expected);
-            eprintln!("  people: {expected} links in {:.3} s", started.elapsed().as_secs_f64());
-            people
-        });
-        let parsed = events::parse(&event_files, threads, &event_ctx);
-        (builder.join().unwrap(), parsed)
-    });
-    let parsed = parsed?;
+    let parsed = events::parse(&event_files, threads, &event_ctx)?;
+    let people = builder.join().unwrap();
     eprintln!("linked ids: {}", people.linked());
     phase("events parse and people");
 

@@ -162,7 +162,7 @@ mod tests {
         map.insert(Key::from_bytes(b"c_1"), 1);
         let campaigns = Campaigns { map, ids: vec![b"organic".to_vec(), b"c_1".to_vec()], channels: vec![b"organic".to_vec(), b"search".to_vec()] };
         let pairs = (0..50).map(|i| (Key::from_bytes(format!("b{i}").as_bytes()), Key::from_bytes(format!("a{i}").as_bytes())));
-        let people = People::build(pairs, 50);
+        let people = People::build(&[pairs.collect()], 1);
         let ctx = Context { window, campaigns: &campaigns, people: &people };
         let mut everything = Vec::new();
         for (file, count) in [0, 1, PREFETCH_AHEAD - 1, PREFETCH_AHEAD, PREFETCH_AHEAD + 1, 300].into_iter().enumerate() {
