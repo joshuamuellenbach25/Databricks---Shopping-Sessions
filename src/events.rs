@@ -89,6 +89,17 @@ impl Sale {
     pub fn cat(self) -> u16 {
         (self.0 >> PRICE_BITS) as u16
     }
+
+    /// The word `from_bits` turns back into this sale.
+    #[inline]
+    pub fn to_bits(self) -> u32 {
+        self.0
+    }
+
+    #[inline]
+    pub fn from_bits(bits: u32) -> Sale {
+        Sale(bits)
+    }
 }
 
 const _: () = assert!(std::mem::size_of::<Raw>() == 32);

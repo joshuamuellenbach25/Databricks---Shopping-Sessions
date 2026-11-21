@@ -23,8 +23,8 @@ A static Rust binary that reads a folder of messy click-stream CSV files (shop e
 2. User IDs of up to 10 characters pack into one 64-bit key whose order matches byte order; longer or unusual IDs are interned.
 3. Links merge user IDs into persons with union-find; each person is named by its byte-wise smallest ID.
 4. Events are spread over buckets by event ID, so each group of copies is deduplicated and validated in one place; the surviving events then move to per-person buckets.
-5. Each person's events are sorted by time and cut into sessions at gaps over 30 minutes. Each session is credited to the latest valid click in the 7 days up to its start, or to `organic`, and campaign assists are counted from the same clicks.
-6. Each thread writes its own `user_daily` Parquet file; `campaign_daily` is one file.
+5. Each person's events fall into 30-minute slots, and sessions are cut between consecutive occupied slots that are not neighbours or whose facing events are more than 30 minutes apart, so no event sort is needed. Each session is credited to the latest valid click in the 7 days up to its start, or to `organic`, and campaign assists are counted from the same clicks.
+6. Each thread writes its own `user_daily` Parquet file a row group at a time between buckets; `campaign_daily` is written as one part per thread, all at once.
 
 ## Correctness checks
 
