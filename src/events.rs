@@ -51,7 +51,7 @@ pub struct Context<'a> {
 /// Raw records per scan thread, then per event bucket.
 pub type Parsed = Vec<Vec<Vec<Raw>>>;
 
-/// Surviving events per person bucket, in one part per dedup thread.
+/// Surviving events per person bucket, split into parts that together hold the bucket.
 pub type Buckets<T> = Vec<Vec<Vec<T>>>;
 
 fn parse_price(b: &[u8]) -> Option<u32> {
