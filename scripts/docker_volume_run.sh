@@ -16,7 +16,7 @@ status=0
 docker run --rm --platform linux/amd64 "$@" \
   --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
   --cap-drop ALL --security-opt no-new-privileges \
-  --pids-limit 4096 --cpus "$CPUS" ${CPUSET:+--cpuset-cpus=$CPUSET} --memory "$MEM" --memory-swap "$MEM" \
+  --pids-limit 4096 --cpus "$CPUS" ${CPUSET:+"--cpuset-cpus=$CPUSET"} --memory "$MEM" --memory-swap "$MEM" \
   --user 1000:1000 \
   -v "$DATA":/data:ro -v "$OUT":/output --tmpfs /scratch:rw,size=1g,mode=1777 \
   -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \

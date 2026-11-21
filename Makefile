@@ -12,10 +12,10 @@ build:
 	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE) .
 
 native:
-	cargo build --release
+	cargo build --release --locked
 
 test:
-	cargo test --release
+	cargo test --release --locked
 
 fixtures: build
 	python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
