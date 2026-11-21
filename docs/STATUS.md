@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 09:49 UTC.
+Updated 2026-11-21 09:51 UTC.
 
 | Item | Value |
 |---|---|
@@ -24,6 +24,7 @@ Updated 2026-11-21 09:49 UTC.
 | opt/parse3 | events parse throughput (block size of the record flush) | cc8936e; gates pass; about 2 percent faster in fast-mode rounds, under the 5 percent floor; stopped |
 | opt/parse4 | events-only tokenizer and a cheaper first touch of input pages, on the 0.96 s main | building |
 | opt/dedup2 | events dedup and clicks on the current main (24 percent of runtime) | building |
+| opt/sessions3 | sessions and output on the 0.96 s main (about 21 percent of runtime) | building |
 | opt/cand4 | the 1.04 s main plus the opt/directio change, comments stripped | 51d0233; gates pass on Windows (55 tests, 36/36, dev MATCH, 6/6); Codex confirmed 1 item (overlay mounts refuse the read probe; fixed: unknown residency now reads directly), 0 left; the Linux code is not compiled here; needs a port onto the 0.96 s main |
 | opt/cand3 | main plus only the opt/sessions2 change, comments stripped | 0890fe7; gates pass (48 tests, 36/36, dev MATCH, 6/6); reference matched in 228 of 228 runs; Codex confirmed 5 items, none in a single fresh run (reused output folder, failed rerun, per-worker category copy, open file handles, a 2^31 event limit); fix 8643225 (output published only after a whole run, writer text no longer leaked); bench median 1738 ms against 1914 ms, 16 of 25 rounds; scored 0.96 s (receipt BB-FEAC4A51); merged into main |
 | opt/nocomments | remove code comments from the shipped files with a parser | superseded: the parse2 merge removed every comment from main (parser check: 0 left) |
