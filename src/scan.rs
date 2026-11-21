@@ -4,8 +4,8 @@ use std::ops::{BitAnd, BitOr, BitXor, Not, Shl, Shr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use memchr::memchr;
-use memmap2::MmapOptions;
+use memchr::{memchr, memrchr};
+use memmap2::{Mmap, MmapOptions};
 
 /// Every `*.csv` file directly in `dir`, sorted by name.
 pub fn csv_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
@@ -39,19 +39,77 @@ where
     W: Fn(&mut S, &[u8], usize, usize) + Sync,
 {
     let clock = std::time::Instant::now();
-    let mut maps = Vec::with_capacity(paths.len());
+    // On Linux each chunk is read with pread into a worker's reused buffer,
+    // so the parse takes no page faults on the map; a chunk the read cannot
+    // serve is parsed from the map instead.
     #[cfg(target_os = "linux")]
-    let mut files = Vec::with_capacity(paths.len());
+    let (maps, files) = map_files(paths, true, |path| File::open(path))?;
+    #[cfg(target_os = "linux")]
+    let pread: &ReadAt<'_> = &|file: usize, offset: usize, buf: &mut [u8]| match &files[file] {
+        Some(handle) => std::os::unix::fs::FileExt::read_exact_at(handle, buf, offset as u64),
+        None => Err(io::Error::from(io::ErrorKind::Unsupported)),
+    };
+    #[cfg(target_os = "linux")]
+    let read = Some(pread);
+    #[cfg(not(target_os = "linux"))]
+    let (maps, _) = map_files(paths, false, |path| File::open(path))?;
+    #[cfg(not(target_os = "linux"))]
+    let read = None;
+    let mapped = clock.elapsed();
+    let (states, fallbacks) = dispatch(&maps, threads, chunk, init, work, read);
+    std::mem::forget(maps);
+    eprintln!(
+        "  scan: {} files, map {:.3} s, parse {:.3} s, read fallbacks {}",
+        paths.len(),
+        mapped.as_secs_f64(),
+        (clock.elapsed() - mapped).as_secs_f64(),
+        fallbacks
+    );
+    Ok(states)
+}
+
+/// Opens and maps every nonempty file of `paths` with `open`. With `keep`, it
+/// also keeps each file's handle, for positional reads, until an open fails:
+/// the kept handles may hold the last free descriptors, so it then closes
+/// them all, keeps no more and opens that file again. Workers parse a file
+/// that kept no handle from its map.
+fn map_files(paths: &[PathBuf], mut keep: bool, mut open: impl FnMut(&Path) -> io::Result<File>) -> io::Result<(Vec<Mmap>, Vec<Option<File>>)> {
+    let mut maps = Vec::with_capacity(paths.len());
+    let mut files: Vec<Option<File>> = Vec::with_capacity(paths.len());
     for path in paths {
-        let file = File::open(path)?;
+        let file = match open(path) {
+            Ok(file) => file,
+            Err(_) if keep && !files.is_empty() => {
+                keep = false;
+                files.iter_mut().for_each(|kept| *kept = None);
+                open(path)?
+            }
+            Err(error) => return Err(error),
+        };
         if file.metadata()?.len() == 0 {
             continue;
         }
-        let map = unsafe { MmapOptions::new().map(&file)? };
-        maps.push(map);
-        #[cfg(target_os = "linux")]
-        files.push(file);
+        maps.push(unsafe { MmapOptions::new().map(&file)? });
+        files.push(keep.then_some(file));
     }
+    Ok((maps, files))
+}
+
+/// Fills all of `buf` from byte `offset` of file number `file`.
+type ReadAt<'a> = dyn Fn(usize, usize, &mut [u8]) -> io::Result<()> + Sync + 'a;
+
+/// Runs `work` on every chunk of every map, as `run_tasks` describes, and
+/// returns the states and how many chunks fell back to the map although
+/// `read` was given. With `read`, each worker reads the bytes a chunk needs
+/// into its own buffer (see `Window::fill`) and parses those; it parses the
+/// chunk from the map when that read fails or cannot hold the chunk's lines.
+fn dispatch<M, S, I, W>(maps: &[M], threads: usize, chunk: usize, init: I, work: W, read: Option<&ReadAt<'_>>) -> (Vec<S>, usize)
+where
+    M: std::ops::Deref<Target = [u8]> + Sync,
+    S: Send,
+    I: Fn() -> S + Sync,
+    W: Fn(&mut S, &[u8], usize, usize) + Sync,
+{
     let mut tasks = Vec::new();
     for (index, map) in maps.iter().enumerate() {
         let mut start = 0;
@@ -60,7 +118,6 @@ where
             start += chunk;
         }
     }
-    let mapped = clock.elapsed();
     let next = AtomicUsize::new(0);
     let fallbacks = AtomicUsize::new(0);
     let states = std::thread::scope(|scope| {
@@ -68,21 +125,14 @@ where
             .map(|_| {
                 scope.spawn(|| {
                     let mut state = init();
-                    // On Linux each chunk is read with pread into this
-                    // thread's reused buffer, so the parse takes no page
-                    // faults on the map; a failed read uses the map instead.
-                    #[cfg(target_os = "linux")]
-                    let mut window = Window::new(chunk, WINDOW_TAIL);
+                    let mut window = Window::new(WINDOW_TAIL);
                     loop {
                         let t = next.fetch_add(1, Ordering::Relaxed);
                         let Some(&(file, start, end)) = tasks.get(t) else {
                             break;
                         };
-                        #[cfg(target_os = "linux")]
-                        {
-                            use std::os::unix::fs::FileExt;
-                            let handle = &files[file];
-                            if let Some((data, from, to)) = window.fill(maps[file].len(), start, end, |offset, buf| handle.read_exact_at(buf, offset as u64)) {
+                        if let Some(read) = read {
+                            if let Some((data, from, to)) = window.fill(maps[file].len(), start, end, |offset, buf| read(file, offset, buf)) {
                                 work(&mut state, data, from, to);
                                 continue;
                             }
@@ -96,63 +146,54 @@ where
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<S>>()
     });
-    std::mem::forget(maps);
-    eprintln!(
-        "  scan: {} files, map {:.3} s, parse {:.3} s, read fallbacks {}",
-        paths.len(),
-        mapped.as_secs_f64(),
-        (clock.elapsed() - mapped).as_secs_f64(),
-        fallbacks.load(Ordering::Relaxed)
-    );
-    Ok(states)
+    (states, fallbacks.into_inner())
 }
 
 /// Bytes read past a chunk's end, to reach the `\n` of the last line the
-/// chunk owns; doubled until that `\n` or the end of the file is in.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// chunk owns; a chunk whose last line runs further is parsed from the map.
 const WINDOW_TAIL: usize = 4096;
 
 /// A reused buffer holding the bytes one chunk's lines need.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct Window {
     buf: Vec<u8>,
     tail: usize,
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl Window {
-    fn new(chunk: usize, tail: usize) -> Self {
-        Window { buf: vec![0; chunk + tail + 1], tail }
+    /// A window that allocates its buffer on its first fill.
+    fn new(tail: usize) -> Self {
+        Window { buf: Vec::new(), tail }
     }
 
-    /// Reads, with `read(offset, buf)` filling all of `buf` from that file
-    /// offset, the bytes of a `len`-byte file that the chunk `start..end`
-    /// needs: the byte before `start` (so `first_line` sees the same `\n`),
-    /// the chunk, and the rest of the file through the `\n` of the last line
-    /// starting before `end`, or to the end of the file. Returns those bytes
-    /// with the chunk bounds in them, or None when a read fails.
-    fn fill<R>(&mut self, len: usize, start: usize, end: usize, mut read: R) -> Option<(&[u8], usize, usize)>
+    /// Reads, with one `read(offset, buf)` that fills all of `buf` from that
+    /// file offset, the bytes of a `len`-byte file from the byte before
+    /// `start` (so `first_line` sees the same `\n`) to `tail` bytes past
+    /// `end`, or to the end of the file. Returns those bytes with the chunk
+    /// bounds in them when they hold every line the chunk owns, through its
+    /// `\n` or the end of the file; None when the last of those lines runs
+    /// further or the read fails. So the buffer never holds more than the
+    /// chunk and `tail + 1` bytes, and a chunk that owns no line, such as one
+    /// inside a long line, costs one read.
+    fn fill<R>(&mut self, len: usize, start: usize, end: usize, read: R) -> Option<(&[u8], usize, usize)>
     where
-        R: FnMut(usize, &mut [u8]) -> io::Result<()>,
+        R: FnOnce(usize, &mut [u8]) -> io::Result<()>,
     {
         debug_assert!(start < end && end <= len);
         let from = start.saturating_sub(1);
-        let mut to = len.min(end.saturating_add(self.tail));
-        let mut filled = 0;
-        loop {
-            let need = to - from;
-            if self.buf.len() < need {
-                self.buf.resize(need, 0);
-            }
-            read(from + filled, &mut self.buf[filled..need]).ok()?;
-            filled = need;
-            // The last owned line ends at the first `\n` at or after end - 1.
-            if to == len || memchr(b'\n', &self.buf[end - 1 - from..filled]).is_some() {
-                break;
-            }
-            to = len.min(to.saturating_add(to - from));
+        let to = len.min(end.saturating_add(self.tail));
+        let need = to - from;
+        if self.buf.len() < need {
+            // Room for the longest fill of a chunk this size, so one
+            // allocation serves every full chunk.
+            self.buf = vec![0; end - start + self.tail + 1];
         }
-        Some((&self.buf[..filled], start - from, end - from))
+        read(from, &mut self.buf[..need]).ok()?;
+        let data = &self.buf[..need];
+        // The chunk owns the lines that start right after a `\n` in
+        // data[..owned]; the last of them ends at the first `\n` from owned on.
+        let owned = end - 1 - from;
+        let whole = to == len || memrchr(b'\n', &data[..owned]).is_none() || memchr(b'\n', &data[owned..]).is_some();
+        whole.then_some((data, start - from, end - from))
     }
 }
 
@@ -722,9 +763,10 @@ mod tests {
     }
 
     /// What `fields` gives for `text` cut into chunks of `chunk` bytes, each
-    /// read through a `Window` with the given tail, in order.
+    /// read through a `Window` with the given tail, or taken from the whole
+    /// text when the window cannot hold its lines, in order.
     fn windowed<const N: usize>(text: &[u8], chunk: usize, tail: usize) -> Rows {
-        let mut window = Window::new(chunk, tail);
+        let mut window = Window::new(tail);
         let mut rows = Vec::new();
         let mut start = 0;
         while start < text.len() {
@@ -733,7 +775,7 @@ mod tests {
                 buf.copy_from_slice(&text[offset..offset + buf.len()]);
                 Ok(())
             };
-            let (data, from, to) = window.fill(text.len(), start, end, read).unwrap();
+            let (data, from, to) = window.fill(text.len(), start, end, read).unwrap_or((text, start, end));
             fields(data, from, to, &mut rows, &|rows: &mut Rows, f: &[&[u8]; N]| rows.push(f.iter().map(|v| v.to_vec()).collect()));
             start = end;
         }
@@ -767,9 +809,131 @@ mod tests {
             check_window::<4>(seed);
             check_window::<7>(seed);
         }
-        let mut window = Window::new(4, 1);
+        let mut window = Window::new(1);
         let failed = window.fill(10, 0, 4, |_, _| Err(io::Error::other("read failed")));
         assert!(failed.is_none());
+    }
+
+    #[test]
+    fn a_long_line_costs_one_bounded_read_per_chunk() {
+        let long = [b"a,".as_slice(), &[b'x'; 1 << 16]].concat();
+        let short: Vec<u8> = (0..100).flat_map(|i| format!("s{i},t{i}\n").into_bytes()).collect();
+        let (chunk, tail) = (2048, 64);
+        // The long line last without its `\n`, last with it, and between short lines.
+        let texts = [
+            [b"h1,h2\n".as_slice(), &long].concat(),
+            [b"h1,h2\n".as_slice(), &long, b"\n"].concat(),
+            [b"h1,h2\n".as_slice(), &short, &long, b"\n", &short].concat(),
+        ];
+        for text in texts {
+            let mut window = Window::new(tail);
+            let (mut rows, mut reads, mut bytes, mut from_map) = (Vec::new(), 0, 0, 0);
+            let mut start = 0;
+            while start < text.len() {
+                let end = text.len().min(start + chunk);
+                let read = |offset: usize, buf: &mut [u8]| {
+                    reads += 1;
+                    bytes += buf.len();
+                    buf.copy_from_slice(&text[offset..offset + buf.len()]);
+                    Ok(())
+                };
+                let (data, from, to) = match window.fill(text.len(), start, end, read) {
+                    Some(got) => got,
+                    None => {
+                        from_map += 1;
+                        (text.as_slice(), start, end)
+                    }
+                };
+                fields(data, from, to, &mut rows, &|rows: &mut Rows, f: &[&[u8]; 2]| rows.push(f.iter().map(|v| v.to_vec()).collect()));
+                assert!(window.buf.len() <= chunk + tail + 1, "a window of {} bytes", window.buf.len());
+                start = end;
+            }
+            let chunks = text.len().div_ceil(chunk);
+            assert_eq!(rows, expected::<2>(&text));
+            // One read per chunk; only the chunk that owns the long line is
+            // parsed from the map.
+            assert_eq!((reads, from_map), (chunks, 1));
+            assert!(bytes <= text.len() + chunks * (tail + 1), "{bytes} bytes read for {} bytes in {chunks} chunks", text.len());
+        }
+    }
+
+    #[test]
+    fn dispatch_parses_every_chunk_whose_read_fails_from_the_map() {
+        let mut rng = Rng(5);
+        let texts: Vec<Vec<u8>> = (0..3)
+            .map(|_| {
+                let mut text = b"header\n".to_vec();
+                for _ in 0..300 {
+                    text.extend_from_slice(&random_line(&mut rng, 4));
+                    text.push(b'\n');
+                }
+                text
+            })
+            .collect();
+        let mut want: Rows = texts.iter().flat_map(|text| expected::<4>(text)).collect();
+        want.sort();
+        let chunk = 100;
+        let chunks: usize = texts.iter().map(|text| text.len().div_ceil(chunk)).sum();
+        let work = |rows: &mut Rows, data: &[u8], start: usize, end: usize| fields(data, start, end, rows, &|rows: &mut Rows, f: &[&[u8]; 4]| rows.push(f.iter().map(|v| v.to_vec()).collect()));
+        let sorted = |states: Vec<Rows>| {
+            let mut rows: Rows = states.into_iter().flatten().collect();
+            rows.sort();
+            rows
+        };
+        let (states, fallbacks) = dispatch(&texts, 3, chunk, Vec::new, &work, None);
+        assert!(sorted(states) == want && fallbacks == 0);
+        // Reads that all succeed, every third read failing, every read failing.
+        for every in [0, 3, 1] {
+            let calls = AtomicUsize::new(0);
+            let failed = AtomicUsize::new(0);
+            let read: &ReadAt<'_> = &|file: usize, offset: usize, buf: &mut [u8]| {
+                let call = calls.fetch_add(1, Ordering::Relaxed);
+                if every > 0 && call % every == 0 {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    return Err(io::Error::other("read failed"));
+                }
+                buf.copy_from_slice(&texts[file][offset..offset + buf.len()]);
+                Ok(())
+            };
+            let (states, fallbacks) = dispatch(&texts, 3, chunk, Vec::new, &work, Some(read));
+            let failed = failed.load(Ordering::Relaxed);
+            assert!(sorted(states) == want, "every {every}");
+            assert_eq!(calls.load(Ordering::Relaxed), chunks, "every {every}");
+            assert_eq!((fallbacks, failed > 0), (failed, every > 0), "every {every}");
+        }
+    }
+
+    #[test]
+    fn a_failed_open_closes_the_kept_handles_and_maps_every_file() {
+        let dir = temp_dir("open");
+        let mut paths = Vec::new();
+        for i in 0..6 {
+            let path = dir.join(format!("{i}.csv"));
+            std::fs::write(&path, if i == 2 { String::new() } else { format!("h\n{i}\n") }).unwrap();
+            paths.push(path);
+        }
+        let want: Vec<String> = [0, 1, 3, 4, 5].iter().map(|i| format!("h\n{i}\n")).collect();
+        let texts = |maps: &[Mmap]| -> Vec<String> { maps.iter().map(|map| String::from_utf8(map.to_vec()).unwrap()).collect() };
+        let (maps, files) = map_files(&paths, true, |path| File::open(path)).unwrap();
+        assert_eq!(texts(&maps), want);
+        assert!(files.len() == 5 && files.iter().all(Option::is_some));
+        // The fourth open fails, as it would at the descriptor limit: the two
+        // kept handles close, the open runs again and every file is mapped.
+        let mut opens = 0;
+        let (maps, files) = map_files(&paths, true, |path| {
+            opens += 1;
+            if opens == 4 {
+                return Err(io::Error::other("too many open files"));
+            }
+            File::open(path)
+        })
+        .unwrap();
+        assert_eq!(opens, 7);
+        assert_eq!(texts(&maps), want);
+        assert!(files.len() == 5 && files.iter().all(Option::is_none));
+        // An open that fails again after the handles close is an error.
+        let failed = map_files(&paths, true, |path| if path.ends_with("3.csv") { Err(io::Error::other("unreadable")) } else { File::open(path) });
+        assert!(failed.is_err());
     }
 
     #[test]
