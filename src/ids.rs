@@ -55,8 +55,6 @@ fn long_ids() -> &'static RwLock<LongIds> {
     LONG_IDS.get_or_init(|| RwLock::new(LongIds::default()))
 }
 
-/// A read view of the interned IDs, taken once by a thread that spells many
-/// keys so it does not lock per key. Interning waits while any view is held.
 pub struct Spelling(RwLockReadGuard<'static, LongIds>);
 
 pub fn spelling() -> Spelling {
@@ -64,7 +62,6 @@ pub fn spelling() -> Spelling {
 }
 
 impl Spelling {
-    /// Appends the bytes of `key` to `out`.
     #[inline]
     pub fn append(&self, key: Key, out: &mut Vec<u8>) {
         if key.0 & LONG == 0 {

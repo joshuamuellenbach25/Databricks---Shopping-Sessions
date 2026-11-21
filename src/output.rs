@@ -52,8 +52,6 @@ fn writer(path: &Path, schema: &str) -> Result<SerializedFileWriter<File>, Fail>
 pub fn write_user_daily(path: &Path, rows: &[UserRow], categories: &[Vec<u8>]) -> Result<(), Fail> {
     let mut file = writer(path, USER_DAILY)?;
     let mut group = file.next_row_group()?;
-    // Every user ID spelled into one buffer under one read of the intern
-    // table; each row's value is a shared slice of it, not its own allocation.
     let mut text = Vec::with_capacity(rows.len() * 10);
     let mut ends = Vec::with_capacity(rows.len());
     let spelling = ids::spelling();
@@ -69,9 +67,13 @@ pub fn write_user_daily(path: &Path, rows: &[UserRow], categories: &[Vec<u8>]) -
         values.push(ByteArray::from(text.slice(start..end)));
         start = end;
     }
+    drop(ends);
+    drop(text);
     column_bytes(&mut group, &values, None)?;
+    values.clear();
     let days: Vec<i32> = rows.iter().map(|r| r.day).collect();
     column_i32(&mut group, &days)?;
+    drop(days);
     let picks: [fn(&UserRow) -> i64; 3] = [|r| r.sessions, |r| r.events, |r| r.revenue];
     let mut longs: Vec<i64> = Vec::with_capacity(rows.len());
     for pick in picks {
@@ -79,10 +81,9 @@ pub fn write_user_daily(path: &Path, rows: &[UserRow], categories: &[Vec<u8>]) -
         longs.extend(rows.iter().map(pick));
         column_i64(&mut group, &longs)?;
     }
+    drop(longs);
     let levels: Vec<i16> = rows.iter().map(|r| i16::from(r.top.is_some())).collect();
-    // Each category's bytes once; rows share them.
     let names: Vec<Bytes> = categories.iter().map(|c| Bytes::copy_from_slice(c)).collect();
-    values.clear();
     values.extend(rows.iter().filter_map(|r| r.top).map(|c| ByteArray::from(names[c as usize].clone())));
     column_bytes(&mut group, &values, Some(&levels))?;
     group.close()?;
