@@ -856,9 +856,8 @@ mod tests {
         let events = vec![Event { person: few, ts: start, sale: Sale::NONE }, Event { person: many, ts: start, sale: Sale::NONE }];
         let click = |person: Key, id: &str, ts: i32, campaign: u16| Click { person, id: Key::from_bytes(id.as_bytes()), ts, campaign };
         let mut clicks = Vec::new();
-        for person in [few, many] {
-            clicks.extend([click(person, "kz", start - 10, 1), click(person, "k1", start - 10, 4), click(person, "k-2", start - 10, 3), click(person, "k0", start - 20, 2)]);
-        }
+        clicks.extend([click(few, "k1", start - 10, 4), click(few, "k-2", start - 10, 3), click(few, "kz", start - 10, 1), click(few, "k0", start - 20, 2)]);
+        clicks.extend([click(many, "k-2", start - 10, 3), click(many, "kz", start - 10, 1), click(many, "k1", start - 10, 4), click(many, "k0", start - 20, 2)]);
         clicks.extend((0..64).map(|i| click(many, &format!("m{i}"), start - 1000 - i, 2)));
         clicks.reverse();
         let mut scratch = Scratch::new(5, days);
