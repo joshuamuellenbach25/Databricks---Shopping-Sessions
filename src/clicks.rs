@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
-use crate::dialect;
-use crate::events::{BUCKETS, BUCKET_BITS, CHUNK};
+use crate::events::{transpose, Buckets, CHUNK, PERSON_BITS, PERSON_BUCKETS};
 use crate::ids::Key;
 use crate::lookups::{Campaigns, Window};
 use crate::people::People;
@@ -42,32 +41,19 @@ fn parse_click(fields: &[&[u8]; 4], ctx: &Context) -> Option<Click> {
 /// Reads every click file and returns the valid clicks bucketed by person.
 /// Copies of a click have identical values, so they need no dedup: a repeated
 /// click credits and assists exactly as one copy does.
-pub fn collect(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Result<Vec<Vec<Click>>> {
+pub fn collect(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Result<Buckets<Click>> {
     let bytes = crate::scan::total_size(paths)? as usize;
-    let per_bucket = bytes / 45 / threads / BUCKETS + 16;
-    let states = crate::scan::run(
+    let per_bucket = bytes / 45 / threads / PERSON_BUCKETS + 16;
+    let states = crate::scan::run_fields::<4, _, _, _>(
         paths,
         threads,
         CHUNK,
-        || (0..BUCKETS).map(|_| Vec::<Click>::with_capacity(per_bucket)).collect::<Vec<_>>(),
-        |state, line| {
-            let mut fields: [&[u8]; 4] = [&[]; 4];
-            if dialect::split(line, &mut fields) {
-                if let Some(click) = parse_click(&fields, ctx) {
-                    state[click.person.bucket(BUCKET_BITS)].push(click);
-                }
+        || (0..PERSON_BUCKETS).map(|_| Vec::<Click>::with_capacity(per_bucket)).collect::<Vec<_>>(),
+        |state, fields| {
+            if let Some(click) = parse_click(fields, ctx) {
+                state[click.person.bucket(PERSON_BITS)].push(click);
             }
         },
     )?;
-    let mut buckets: Vec<Vec<Click>> = (0..BUCKETS).map(|_| Vec::new()).collect();
-    for state in states {
-        for (b, part) in state.into_iter().enumerate() {
-            if buckets[b].is_empty() {
-                buckets[b] = part;
-            } else {
-                buckets[b].extend_from_slice(&part);
-            }
-        }
-    }
-    Ok(buckets)
+    Ok(transpose(states))
 }

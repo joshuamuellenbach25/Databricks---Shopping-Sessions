@@ -5,14 +5,17 @@ use std::sync::Mutex;
 use hashbrown::hash_map::Entry;
 use hashbrown::HashMap;
 
-use crate::dialect;
 use crate::ids::Key;
 use crate::lookups::{Products, Window};
 use crate::people::People;
 use crate::timestamp::{self, DAY};
 
-pub const BUCKET_BITS: u32 = 6;
-pub const BUCKETS: usize = 1 << BUCKET_BITS;
+/// Buckets by event_id for dedup: small enough that each bucket's map stays in cache.
+pub const EVENT_BITS: u32 = 10;
+pub const EVENT_BUCKETS: usize = 1 << EVENT_BITS;
+/// Buckets by person for sessions.
+pub const PERSON_BITS: u32 = 8;
+pub const PERSON_BUCKETS: usize = 1 << PERSON_BITS;
 pub const CHUNK: usize = 2 << 20;
 
 /// One parsed line of events, before dedup.
@@ -41,8 +44,13 @@ pub struct Event {
 pub struct Context<'a> {
     pub window: Window,
     pub products: &'a Products,
-    pub people: &'a People,
 }
+
+/// Raw records per scan thread, then per event bucket.
+pub type Parsed = Vec<Vec<Vec<Raw>>>;
+
+/// Surviving events per person bucket, in one part per dedup thread.
+pub type Buckets<T> = Vec<Vec<Vec<T>>>;
 
 fn parse_price(b: &[u8]) -> Option<u32> {
     if b.is_empty() {
@@ -103,43 +111,42 @@ fn parse_event(fields: &[&[u8]; 7], ctx: &Context) -> Option<Raw> {
     })
 }
 
-/// Reads every event file, dedups on event_id (smallest ingest wins), keeps
-/// the valid, not-late events and returns them bucketed by person.
-pub fn collect(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Result<Vec<Vec<Event>>> {
+/// Reads every event file into raw records, bucketed by event_id.
+pub fn parse(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Result<Parsed> {
     let bytes = crate::scan::total_size(paths)? as usize;
-    let per_bucket = bytes / 70 / threads / BUCKETS + 16;
-    let states = crate::scan::run(
+    let per_bucket = bytes / 70 / threads / EVENT_BUCKETS + 16;
+    crate::scan::run_fields::<7, _, _, _>(
         paths,
         threads,
         CHUNK,
-        || (0..BUCKETS).map(|_| Vec::<Raw>::with_capacity(per_bucket)).collect::<Vec<_>>(),
-        |state, line| {
-            let mut fields: [&[u8]; 7] = [&[]; 7];
-            if dialect::split(line, &mut fields) {
-                if let Some(raw) = parse_event(&fields, ctx) {
-                    state[raw.event.bucket(BUCKET_BITS)].push(raw);
-                }
+        || (0..EVENT_BUCKETS).map(|_| Vec::<Raw>::with_capacity(per_bucket)).collect::<Vec<_>>(),
+        |state, fields| {
+            if let Some(raw) = parse_event(fields, ctx) {
+                state[raw.event.bucket(EVENT_BITS)].push(raw);
             }
         },
-    )?;
+    )
+}
 
-    let by_bucket: Vec<Mutex<Vec<Vec<Raw>>>> = (0..BUCKETS).map(|_| Mutex::new(Vec::new())).collect();
-    for state in states {
+/// Dedups on event_id (smallest ingest wins, before validation), keeps the
+/// valid, not-late events and returns them bucketed by person.
+pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> {
+    let by_bucket: Vec<Mutex<Vec<Vec<Raw>>>> = (0..EVENT_BUCKETS).map(|_| Mutex::new(Vec::with_capacity(parsed.len()))).collect();
+    for state in parsed {
         for (b, part) in state.into_iter().enumerate() {
             by_bucket[b].lock().unwrap().push(part);
         }
     }
-
     let next = AtomicUsize::new(0);
     let outputs: Vec<Vec<Vec<Event>>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| {
-                    let mut out: Vec<Vec<Event>> = (0..BUCKETS).map(|_| Vec::new()).collect();
+                    let mut out: Vec<Vec<Event>> = (0..PERSON_BUCKETS).map(|_| Vec::new()).collect();
                     let mut kept: HashMap<Key, (i64, u32, u32)> = HashMap::new();
                     loop {
                         let b = next.fetch_add(1, Ordering::Relaxed);
-                        if b >= BUCKETS {
+                        if b >= EVENT_BUCKETS {
                             break;
                         }
                         let parts = std::mem::take(&mut *by_bucket[b].lock().unwrap());
@@ -163,8 +170,8 @@ pub fn collect(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Res
                         for &(_, s, p) in kept.values() {
                             let raw = &parts[s as usize][p as usize];
                             if raw.ok {
-                                let person = ctx.people.name_of(raw.user);
-                                out[person.bucket(BUCKET_BITS)].push(Event {
+                                let person = people.name_of(raw.user);
+                                out[person.bucket(PERSON_BITS)].push(Event {
                                     person,
                                     ts: raw.ts,
                                     price: raw.price,
@@ -180,16 +187,20 @@ pub fn collect(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Res
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    transpose(outputs)
+}
 
-    let mut buckets: Vec<Vec<Event>> = (0..BUCKETS).map(|_| Vec::new()).collect();
-    for out in outputs {
-        for (b, part) in out.into_iter().enumerate() {
-            if buckets[b].is_empty() {
-                buckets[b] = part;
-            } else {
-                buckets[b].extend_from_slice(&part);
+/// Turns per-thread lists of buckets into per-bucket lists of parts, moving
+/// only the vectors, never their contents.
+pub fn transpose<T>(per_thread: Vec<Vec<Vec<T>>>) -> Buckets<T> {
+    let buckets = per_thread.first().map_or(0, Vec::len);
+    let mut out: Buckets<T> = (0..buckets).map(|_| Vec::with_capacity(per_thread.len())).collect();
+    for state in per_thread {
+        for (b, part) in state.into_iter().enumerate() {
+            if !part.is_empty() {
+                out[b].push(part);
             }
         }
     }
-    Ok(buckets)
+    out
 }

@@ -16,7 +16,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use clicks::Click;
+use events::Event;
+use people::People;
 use sessions::{Accum, Rules, Scratch, UserRow};
+
+type Fail = Box<dyn std::error::Error + Send + Sync>;
+
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
     match run() {
@@ -32,7 +40,7 @@ fn env_path(name: &str, default: &str) -> PathBuf {
     PathBuf::from(std::env::var_os(name).unwrap_or_else(|| default.into()))
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn run() -> Result<(), Fail> {
     let clock = Instant::now();
     let mut last = clock.elapsed();
     let mut phase = |name: &str| {
@@ -55,56 +63,76 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let campaign_dir = out.join("campaign_daily");
     std::fs::create_dir_all(&user_dir)?;
     std::fs::create_dir_all(&campaign_dir)?;
-    phase("lookups");
+    let link_pairs = links::collect(&scan::csv_files(&data.join("links"))?, threads)?;
+    let event_files = scan::csv_files(&data.join("events"))?;
+    let click_files = scan::csv_files(&data.join("clicks"))?;
+    phase("lookups and links");
 
-    let people = links::collect(&scan::csv_files(&data.join("links"))?, threads)?;
+    let event_ctx = events::Context { window, products: &products };
+    let (people, parsed) = std::thread::scope(|scope| {
+        let builder = scope.spawn(|| {
+            let started = Instant::now();
+            let expected = link_pairs.iter().map(Vec::len).sum();
+            let people = People::build(link_pairs.into_iter().flatten(), expected);
+            eprintln!("  people: {expected} links in {:.3} s", started.elapsed().as_secs_f64());
+            people
+        });
+        let parsed = events::parse(&event_files, threads, &event_ctx);
+        (builder.join().unwrap(), parsed)
+    });
+    let parsed = parsed?;
     eprintln!("linked ids: {}", people.linked());
-    phase("links");
+    phase("events parse and people");
 
-    let event_ctx = events::Context { window, products: &products, people: &people };
-    let event_buckets = events::collect(&scan::csv_files(&data.join("events"))?, threads, &event_ctx)?;
-    eprintln!("surviving events: {}", event_buckets.iter().map(Vec::len).sum::<usize>());
-    phase("events");
+    let event_buckets = events::dedup(parsed, threads, &people);
+    eprintln!("surviving events: {}", count(&event_buckets));
+    phase("events dedup");
 
     let click_ctx = clicks::Context { window, campaigns: &campaigns, people: &people };
-    let click_buckets = clicks::collect(&scan::csv_files(&data.join("clicks"))?, threads, &click_ctx)?;
-    eprintln!("valid clicks: {}", click_buckets.iter().map(Vec::len).sum::<usize>());
+    let click_buckets = clicks::collect(&click_files, threads, &click_ctx)?;
+    eprintln!("valid clicks: {}", count(&click_buckets));
     phase("clicks");
 
     let base_day = timestamp::day_of(window.start);
     let days = (timestamp::day_of(window.end - 1) - base_day + 1) as usize;
     let rules = Rules { base_day, days, products: &products };
-    let buckets: Vec<Mutex<Option<(Vec<events::Event>, Vec<clicks::Click>)>>> = event_buckets
+    let mut click_buckets = click_buckets.into_iter();
+    let buckets: Vec<Mutex<Option<(Vec<Vec<Event>>, Vec<Vec<Click>>)>>> = event_buckets
         .into_iter()
-        .zip(click_buckets)
-        .map(|pair| Mutex::new(Some(pair)))
+        .map(|parts| Mutex::new(Some((parts, click_buckets.next().unwrap_or_default()))))
         .collect();
     let next = AtomicUsize::new(0);
-    let written = AtomicUsize::new(0);
-    let accums: Vec<Result<Accum, String>> = std::thread::scope(|scope| {
+    let results: Vec<Result<Accum, String>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| -> Result<Accum, String> {
+            .map(|thread| {
+                let (buckets, next, rules, campaigns, products, user_dir) = (&buckets, &next, &rules, &campaigns, &products, &user_dir);
+                scope.spawn(move || -> Result<Accum, String> {
                     let mut accum = Accum::new(campaigns.ids.len(), days);
                     let mut scratch = Scratch::new(days);
                     let mut rows: Vec<UserRow> = Vec::new();
+                    let mut bucket_events: Vec<Event> = Vec::new();
+                    let mut bucket_clicks: Vec<Click> = Vec::new();
                     loop {
                         let b = next.fetch_add(1, Ordering::Relaxed);
                         if b >= buckets.len() {
                             break;
                         }
-                        let Some((mut bucket_events, mut bucket_clicks)) = buckets[b].lock().unwrap().take() else {
+                        let Some((event_parts, click_parts)) = buckets[b].lock().unwrap().take() else {
                             continue;
                         };
-                        rows.clear();
-                        sessions::run_bucket(&mut bucket_events, &mut bucket_clicks, &rules, &mut scratch, &mut rows, &mut accum);
-                        drop(bucket_events);
-                        drop(bucket_clicks);
-                        if !rows.is_empty() {
-                            let path = user_dir.join(format!("part-{b:03}.parquet"));
-                            output::write_user_daily(&path, &rows, &products.categories).map_err(|e| format!("{}: {e}", path.display()))?;
-                            written.fetch_add(1, Ordering::Relaxed);
+                        bucket_events.clear();
+                        for part in event_parts {
+                            bucket_events.extend_from_slice(&part);
                         }
+                        bucket_clicks.clear();
+                        for part in click_parts {
+                            bucket_clicks.extend_from_slice(&part);
+                        }
+                        sessions::run_bucket(&mut bucket_events, &mut bucket_clicks, rules, &mut scratch, &mut rows, &mut accum);
+                    }
+                    if thread == 0 || !rows.is_empty() {
+                        let path = user_dir.join(format!("part-{thread:03}.parquet"));
+                        output::write_user_daily(&path, &rows, &products.categories).map_err(|e| format!("{}: {e}", path.display()))?;
                     }
                     Ok(accum)
                 })
@@ -113,11 +141,8 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let mut total = Accum::new(campaigns.ids.len(), days);
-    for accum in accums {
+    for accum in results {
         total.merge(&accum?);
-    }
-    if written.load(Ordering::Relaxed) == 0 {
-        output::write_user_daily(&user_dir.join("part-000.parquet"), &[], &products.categories)?;
     }
     output::write_campaign_daily(&campaign_dir.join("part-000.parquet"), &total, &campaigns, base_day)?;
     phase("sessions and output");
@@ -125,6 +150,10 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("sessions: {sessions_total}");
     check_output(&out)?;
     Ok(())
+}
+
+fn count<T>(buckets: &[Vec<Vec<T>>]) -> usize {
+    buckets.iter().flatten().map(Vec::len).sum()
 }
 
 fn check_output(out: &Path) -> Result<(), String> {

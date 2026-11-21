@@ -2,3 +2,5 @@ target/
 dev/
 out/
 .env
+artifacts/
+__pycache__/

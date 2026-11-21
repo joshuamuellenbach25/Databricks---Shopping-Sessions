@@ -9,10 +9,10 @@ pub struct People {
 }
 
 impl People {
-    pub fn build(pairs: impl IntoIterator<Item = (Key, Key)>) -> People {
-        let mut index: HashMap<Key, u32> = HashMap::new();
-        let mut keys: Vec<Key> = Vec::new();
-        let mut parent: Vec<u32> = Vec::new();
+    pub fn build(pairs: impl IntoIterator<Item = (Key, Key)>, expected: usize) -> People {
+        let mut index: HashMap<Key, u32> = HashMap::with_capacity(expected * 2);
+        let mut keys: Vec<Key> = Vec::with_capacity(expected * 2);
+        let mut parent: Vec<u32> = Vec::with_capacity(expected * 2);
         let mut intern = |key: Key, keys: &mut Vec<Key>, parent: &mut Vec<u32>| -> u32 {
             *index.entry(key).or_insert_with(|| {
                 keys.push(key);
@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn chains_across_order_and_direction() {
-        let people = People::build(vec![(k("u3"), k("u9")), (k("u9"), k("u2")), (k("U7"), k("u9")), (k("u10"), k("u10"))]);
+        let people = People::build(vec![(k("u3"), k("u9")), (k("u9"), k("u2")), (k("U7"), k("u9")), (k("u10"), k("u10"))], 4);
         for id in ["u3", "u9", "u2", "U7"] {
             assert_eq!(people.name_of(k(id)), k("U7"), "{id}");
         }
@@ -95,7 +95,7 @@ mod tests {
         for i in 0..1000 {
             pairs.push((k(&format!("p{i}")), k("kiosk")));
         }
-        let people = People::build(pairs);
+        let people = People::build(pairs, 1400);
         assert_eq!(people.name_of(k("c400")), k("c0"));
         assert_eq!(people.name_of(k("p999")), k("kiosk"));
         assert_eq!(people.name_of(k("c0")), k("c0"));
