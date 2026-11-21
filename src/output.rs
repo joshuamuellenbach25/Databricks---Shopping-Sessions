@@ -8,6 +8,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 
+use crate::ids::PACKED_MAX;
 use crate::lookups::Campaigns;
 use crate::sessions::{Accum, UserRow};
 
@@ -50,7 +51,22 @@ fn writer(path: &Path, schema: &str) -> Result<SerializedFileWriter<File>, Fail>
 pub fn write_user_daily(path: &Path, rows: &[UserRow], categories: &[Vec<u8>]) -> Result<(), Fail> {
     let mut file = writer(path, USER_DAILY)?;
     let mut group = file.next_row_group()?;
-    let ids: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.person.to_vec())).collect();
+    let mut text = Vec::with_capacity(rows.len() * PACKED_MAX);
+    let mut ends = Vec::with_capacity(rows.len());
+    for r in rows {
+        r.person.append_to(&mut text);
+        ends.push(text.len());
+    }
+    let joined = ByteArray::from(text);
+    let mut start = 0;
+    let ids: Vec<ByteArray> = ends
+        .iter()
+        .map(|&end| {
+            let id = joined.slice(start, end - start);
+            start = end;
+            id
+        })
+        .collect();
     column_bytes(&mut group, &ids, None)?;
     let days: Vec<i32> = rows.iter().map(|r| r.day).collect();
     column_i32(&mut group, &days)?;
@@ -60,7 +76,8 @@ pub fn write_user_daily(path: &Path, rows: &[UserRow], categories: &[Vec<u8>]) -
         column_i64(&mut group, &values)?;
     }
     let levels: Vec<i16> = rows.iter().map(|r| i16::from(r.top.is_some())).collect();
-    let tops: Vec<ByteArray> = rows.iter().filter_map(|r| r.top).map(|c| ByteArray::from(categories[c as usize].clone())).collect();
+    let names: Vec<ByteArray> = categories.iter().map(|c| ByteArray::from(c.clone())).collect();
+    let tops: Vec<ByteArray> = rows.iter().filter_map(|r| r.top).map(|c| names[c as usize].clone()).collect();
     column_bytes(&mut group, &tops, Some(&levels))?;
     group.close()?;
     file.close()?;
