@@ -3,10 +3,17 @@ use hashbrown::HashMap;
 use crate::ids::Key;
 
 /// Linked IDs joined into persons. `name_of` gives the person's name (the
-/// byte-wise smallest of its IDs); an ID in no link names itself.
+/// byte-wise smallest of its IDs); an ID in no link names itself. Names live
+/// in an open-addressing table of (id, name) words; id 0 marks an empty slot,
+/// which no linked ID can be because links with an empty side are dropped.
 pub struct People {
-    names: HashMap<Key, Key>,
+    slots: Vec<[u64; 2]>,
+    mask: usize,
+    shift: u32,
+    linked: usize,
 }
+
+const SLOT_MIX: u64 = 0xD6E8_FEB8_6659_FD93;
 
 impl People {
     pub fn build(pairs: impl IntoIterator<Item = (Key, Key)>, expected: usize) -> People {
@@ -36,26 +43,65 @@ impl People {
                 best[root] = i;
             }
         }
-        let mut names = HashMap::with_capacity(keys.len());
+        let mut names: Vec<(Key, Key)> = Vec::with_capacity(keys.len());
         for i in 0..keys.len() as u32 {
             let root = find(&mut parent, i) as usize;
             let name = keys[best[root] as usize];
             if name != keys[i as usize] {
-                names.insert(keys[i as usize], name);
+                names.push((keys[i as usize], name));
             }
         }
-        People { names }
+        let capacity = (names.len() * 2).next_power_of_two().max(16);
+        let mut people = People {
+            slots: vec![[0, 0]; capacity],
+            mask: capacity - 1,
+            shift: 64 - capacity.trailing_zeros(),
+            linked: names.len(),
+        };
+        for (id, name) in names {
+            let mut i = people.slot(id);
+            while people.slots[i][0] != 0 {
+                i = (i + 1) & people.mask;
+            }
+            people.slots[i] = [id.0, name.0];
+        }
+        people
     }
 
+    #[inline(always)]
+    fn slot(&self, key: Key) -> usize {
+        (key.0.wrapping_mul(SLOT_MIX) >> self.shift) as usize
+    }
+
+    /// Starts loading the slot `name_of(key)` reads first.
+    #[inline(always)]
+    pub fn prefetch(&self, key: Key) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch::<_MM_HINT_T0>(self.slots.as_ptr().add(self.slot(key)) as *const i8);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = key;
+    }
+
+    #[inline(always)]
     pub fn name_of(&self, key: Key) -> Key {
-        match self.names.get(&key) {
-            Some(&name) => name,
-            None => key,
+        let mut i = self.slot(key);
+        loop {
+            let [id, name] = self.slots[i];
+            if id == key.0 {
+                return if id == 0 { key } else { Key(name) };
+            }
+            if id == 0 {
+                return key;
+            }
+            i = (i + 1) & self.mask;
         }
     }
 
     pub fn linked(&self) -> usize {
-        self.names.len()
+        self.linked
     }
 }
 
@@ -99,5 +145,56 @@ mod tests {
         assert_eq!(people.name_of(k("c400")), k("c0"));
         assert_eq!(people.name_of(k("p999")), k("kiosk"));
         assert_eq!(people.name_of(k("c0")), k("c0"));
+    }
+
+    #[test]
+    fn table_matches_a_plain_map_on_many_ids() {
+        let mut pairs = Vec::new();
+        let mut x: u64 = 7;
+        for _ in 0..20_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let a = format!("u{}", (x >> 40) % 30_000);
+            let b = format!("u{}", (x >> 10) % 30_000);
+            pairs.push((k(&a), k(&b)));
+        }
+        let people = People::build(pairs.clone(), pairs.len());
+        let mut parent: HashMap<String, String> = HashMap::new();
+        fn root(parent: &mut HashMap<String, String>, x: &str) -> String {
+            let mut cur = x.to_string();
+            while let Some(next) = parent.get(&cur).cloned() {
+                if next == cur {
+                    break;
+                }
+                cur = next;
+            }
+            cur
+        }
+        let mut x: u64 = 7;
+        for _ in 0..20_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let a = format!("u{}", (x >> 40) % 30_000);
+            let b = format!("u{}", (x >> 10) % 30_000);
+            parent.entry(a.clone()).or_insert_with(|| a.clone());
+            parent.entry(b.clone()).or_insert_with(|| b.clone());
+            let (ra, rb) = (root(&mut parent, &a), root(&mut parent, &b));
+            if ra != rb {
+                parent.insert(ra, rb);
+            }
+        }
+        let ids: Vec<String> = parent.keys().cloned().collect();
+        let mut smallest: HashMap<String, String> = HashMap::new();
+        for id in &ids {
+            let r = root(&mut parent, id);
+            let entry = smallest.entry(r).or_insert_with(|| id.clone());
+            if id.as_bytes() < entry.as_bytes() {
+                *entry = id.clone();
+            }
+        }
+        for id in &ids {
+            let r = root(&mut parent, id);
+            assert_eq!(people.name_of(k(id)), k(&smallest[&r]), "{id}");
+        }
+        assert_eq!(people.name_of(k("u99999")), k("u99999"));
+        assert_eq!(people.name_of(k("")), k(""));
     }
 }

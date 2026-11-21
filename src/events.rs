@@ -17,6 +17,8 @@ pub const EVENT_BUCKETS: usize = 1 << EVENT_BITS;
 pub const PERSON_BITS: u32 = 8;
 pub const PERSON_BUCKETS: usize = 1 << PERSON_BITS;
 pub const CHUNK: usize = 2 << 20;
+/// How many survivors ahead the person table slot is prefetched.
+const PREFETCH_AHEAD: usize = 16;
 
 /// One parsed line of events, before dedup.
 #[derive(Clone, Copy)]
@@ -144,6 +146,7 @@ pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> 
                 scope.spawn(|| {
                     let mut out: Vec<Vec<Event>> = (0..PERSON_BUCKETS).map(|_| Vec::new()).collect();
                     let mut kept: HashMap<Key, (i64, u32, u32)> = HashMap::new();
+                    let mut survivors: Vec<(u32, u32)> = Vec::new();
                     loop {
                         let b = next.fetch_add(1, Ordering::Relaxed);
                         if b >= EVENT_BUCKETS {
@@ -167,18 +170,21 @@ pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> 
                                 }
                             }
                         }
-                        for &(_, s, p) in kept.values() {
-                            let raw = &parts[s as usize][p as usize];
-                            if raw.ok {
-                                let person = people.name_of(raw.user);
-                                out[person.bucket(PERSON_BITS)].push(Event {
-                                    person,
-                                    ts: raw.ts,
-                                    price: raw.price,
-                                    cat: raw.cat,
-                                    purchase: raw.price > 0,
-                                });
+                        survivors.clear();
+                        survivors.extend(kept.values().map(|&(_, s, p)| (s, p)).filter(|&(s, p)| parts[s as usize][p as usize].ok));
+                        for (i, &(s, p)) in survivors.iter().enumerate() {
+                            if let Some(&(s_ahead, p_ahead)) = survivors.get(i + PREFETCH_AHEAD) {
+                                people.prefetch(parts[s_ahead as usize][p_ahead as usize].user);
                             }
+                            let raw = &parts[s as usize][p as usize];
+                            let person = people.name_of(raw.user);
+                            out[person.bucket(PERSON_BITS)].push(Event {
+                                person,
+                                ts: raw.ts,
+                                price: raw.price,
+                                cat: raw.cat,
+                                purchase: raw.price > 0,
+                            });
                         }
                     }
                     out

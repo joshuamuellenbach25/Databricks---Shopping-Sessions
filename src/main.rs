@@ -102,11 +102,12 @@ fn run() -> Result<(), Fail> {
         .map(|parts| Mutex::new(Some((parts, click_buckets.next().unwrap_or_default()))))
         .collect();
     let next = AtomicUsize::new(0);
-    let results: Vec<Result<Accum, String>> = std::thread::scope(|scope| {
+    let results: Vec<Result<(Accum, f64, f64), String>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|thread| {
                 let (buckets, next, rules, campaigns, products, user_dir) = (&buckets, &next, &rules, &campaigns, &products, &user_dir);
-                scope.spawn(move || -> Result<Accum, String> {
+                scope.spawn(move || -> Result<(Accum, f64, f64), String> {
+                    let started = Instant::now();
                     let mut accum = Accum::new(campaigns.ids.len(), days);
                     let mut scratch = Scratch::new(days);
                     let mut rows: Vec<UserRow> = Vec::new();
@@ -130,20 +131,26 @@ fn run() -> Result<(), Fail> {
                         }
                         sessions::run_bucket(&mut bucket_events, &mut bucket_clicks, rules, &mut scratch, &mut rows, &mut accum);
                     }
+                    let computed = started.elapsed().as_secs_f64();
                     if thread == 0 || !rows.is_empty() {
                         let path = user_dir.join(format!("part-{thread:03}.parquet"));
                         output::write_user_daily(&path, &rows, &products.categories).map_err(|e| format!("{}: {e}", path.display()))?;
                     }
-                    Ok(accum)
+                    Ok((accum, computed, started.elapsed().as_secs_f64() - computed))
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let mut total = Accum::new(campaigns.ids.len(), days);
-    for accum in results {
-        total.merge(&accum?);
+    let (mut compute_max, mut write_max) = (0f64, 0f64);
+    for result in results {
+        let (accum, computed, written) = result?;
+        compute_max = compute_max.max(computed);
+        write_max = write_max.max(written);
+        total.merge(&accum);
     }
+    eprintln!("  sessions compute max {compute_max:.3} s, user_daily write max {write_max:.3} s");
     output::write_campaign_daily(&campaign_dir.join("part-000.parquet"), &total, &campaigns, base_day)?;
     phase("sessions and output");
     let sessions_total: i64 = total.cells.iter().map(|c| c.sessions).sum();
