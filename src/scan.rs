@@ -62,19 +62,19 @@ where
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| {
-                    let mut state = init();
+                    let mut state = None;
                     loop {
                         let t = next.fetch_add(1, Ordering::Relaxed);
                         let Some(&(file, start, end)) = tasks.get(t) else {
                             break;
                         };
-                        work(&mut state, &maps[file], start, end);
+                        work(state.get_or_insert_with(&init), &maps[file], start, end);
                     }
                     state
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<S>>()
+        handles.into_iter().filter_map(|h| h.join().unwrap()).collect::<Vec<S>>()
     });
     std::mem::forget(maps);
     eprintln!("  scan: {} files, map {:.3} s, parse {:.3} s", paths.len(), mapped.as_secs_f64(), (clock.elapsed() - mapped).as_secs_f64());
@@ -352,6 +352,23 @@ mod tests {
             let mut got: Vec<String> = states.into_iter().flatten().collect();
             got.sort();
             assert_eq!(got, expected, "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn only_workers_that_take_a_chunk_make_a_state() {
+        let dir = temp_dir("idle");
+        std::fs::write(dir.join("a.csv"), b"h1,h2\nx,y\n").unwrap();
+        std::fs::write(dir.join("b.csv"), b"").unwrap();
+        let made = AtomicUsize::new(0);
+        for (files, want) in [(vec![dir.join("a.csv"), dir.join("b.csv")], vec![vec!["x,y".to_string()]]), (vec![dir.join("b.csv")], Vec::new())] {
+            made.store(0, Ordering::Relaxed);
+            let init = || {
+                made.fetch_add(1, Ordering::Relaxed);
+                Vec::new()
+            };
+            let states = run(&files, 8, 1 << 20, init, |s: &mut Vec<String>, l| s.push(String::from_utf8(l.to_vec()).unwrap())).unwrap();
+            assert_eq!((made.load(Ordering::Relaxed), states), (want.len(), want));
         }
     }
 

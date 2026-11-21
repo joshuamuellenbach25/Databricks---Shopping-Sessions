@@ -1,30 +1,20 @@
-//! Faults in the spare capacity of freshly sized record vectors before a scan
-//! thread starts parsing, so the kernel zeroes their pages in a few large
-//! requests instead of one page fault at a time inside the parse loop. Only
-//! Linux does anything; elsewhere `vectors` leaves the vectors as they are.
-//! Nothing here changes what a vector holds: it reads no record and writes
-//! only spare capacity, which the vector treats as uninitialized.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 const PAGE: usize = 4096;
 const HUGE_PAGE: usize = 2 << 20;
-/// `MADV_HUGEPAGE` and `MADV_POPULATE_WRITE` (Linux 5.14) from the Linux uapi.
+const MIN_SPARE: usize = 4 * PAGE;
 const MADV_HUGEPAGE: i32 = 14;
 const MADV_POPULATE_WRITE: i32 = 23;
 
-/// One madvise call on `len` bytes from `addr`: Ok, or the errno it failed with.
 type Advise = fn(usize, usize, i32) -> Result<(), i32>;
 
-/// What the prefaults did. After the first failed `MADV_POPULATE_WRITE`
-/// (an older kernel answers EINVAL) every later range is touched instead.
 #[derive(Default)]
 struct Stats {
     populate_off: AtomicBool,
     populate_errno: AtomicI32,
     populated: AtomicUsize,
-    touched_pages: AtomicUsize,
     huge_ok: AtomicUsize,
     huge_failed: AtomicUsize,
     huge_errno: AtomicI32,
@@ -34,13 +24,11 @@ static STATS: Stats = Stats {
     populate_off: AtomicBool::new(false),
     populate_errno: AtomicI32::new(0),
     populated: AtomicUsize::new(0),
-    touched_pages: AtomicUsize::new(0),
     huge_ok: AtomicUsize::new(0),
     huge_failed: AtomicUsize::new(0),
     huge_errno: AtomicI32::new(0),
 };
 
-/// Prefaults the spare capacity of every vector in `vs`, on the calling thread.
 pub fn vectors<T>(vs: &mut [Vec<T>]) {
     #[cfg(target_os = "linux")]
     prefault(vs, linux::madvise, &STATS);
@@ -48,13 +36,14 @@ pub fn vectors<T>(vs: &mut [Vec<T>]) {
     let _ = vs;
 }
 
-/// One line for the log: what the prefaults did so far.
 pub fn report() -> String {
-    let s = &STATS;
+    line(&STATS)
+}
+
+fn line(s: &Stats) -> String {
     format!(
-        "prefault: populated {} MB, touched {} pages (populate errno {}), hugepage hints {} ok {} failed (errno {})",
+        "prefault: populate requests {} MiB (populate errno {}), hugepage hints {} ok {} failed (errno {})",
         s.populated.load(Ordering::Relaxed) >> 20,
-        s.touched_pages.load(Ordering::Relaxed),
         s.populate_errno.load(Ordering::Relaxed),
         s.huge_ok.load(Ordering::Relaxed),
         s.huge_failed.load(Ordering::Relaxed),
@@ -62,20 +51,16 @@ pub fn report() -> String {
     )
 }
 
-/// The byte range of `v`'s spare capacity, or None when it has none.
 fn spare<T>(v: &mut Vec<T>) -> Option<(usize, usize)> {
     let spare = v.spare_capacity_mut();
     let bytes = std::mem::size_of_val(spare);
-    if bytes == 0 {
+    if bytes < MIN_SPARE {
         return None;
     }
     let start = spare.as_mut_ptr() as usize;
     Some((start, start + bytes))
 }
 
-/// Asks for huge pages over the 2 MiB pages inside the span of all the spare
-/// ranges (a hint: a failure leaves the memory as it was), then populates
-/// each range for writing, or touches it when populating fails.
 fn prefault<T>(vs: &mut [Vec<T>], advise: Advise, stats: &Stats) {
     let mut low = usize::MAX;
     let mut high = 0;
@@ -102,48 +87,24 @@ fn prefault<T>(vs: &mut [Vec<T>], advise: Advise, stats: &Stats) {
         }
     }
     for v in vs.iter_mut() {
+        if stats.populate_off.load(Ordering::Relaxed) {
+            return;
+        }
         let Some((start, end)) = spare(v) else {
             continue;
         };
-        if !stats.populate_off.load(Ordering::Relaxed) {
-            // The pages holding the range's first and last bytes are mapped,
-            // since the vector owns those bytes, so rounding out to whole
-            // pages stays inside mapped memory; populating changes no byte.
-            let page_start = start / PAGE * PAGE;
-            let page_end = end.next_multiple_of(PAGE);
-            match advise(page_start, page_end - page_start, MADV_POPULATE_WRITE) {
-                Ok(()) => {
-                    stats.populated.fetch_add(page_end - page_start, Ordering::Relaxed);
-                    continue;
-                }
-                Err(errno) => {
-                    stats.populate_errno.store(errno, Ordering::Relaxed);
-                    stats.populate_off.store(true, Ordering::Relaxed);
-                }
+        let page_start = start / PAGE * PAGE;
+        let page_end = end.next_multiple_of(PAGE);
+        match advise(page_start, page_end - page_start, MADV_POPULATE_WRITE) {
+            Ok(()) => {
+                stats.populated.fetch_add(page_end - page_start, Ordering::Relaxed);
+            }
+            Err(errno) => {
+                stats.populate_errno.store(errno, Ordering::Relaxed);
+                stats.populate_off.store(true, Ordering::Relaxed);
             }
         }
-        let pages = touch(v);
-        stats.touched_pages.fetch_add(pages, Ordering::Relaxed);
     }
-}
-
-/// Writes a zero byte into `v`'s spare capacity in every 4 KiB page it
-/// reaches, and returns how many pages that was.
-fn touch<T>(v: &mut Vec<T>) -> usize {
-    let spare = v.spare_capacity_mut();
-    let bytes = std::mem::size_of_val(spare);
-    let base = spare.as_mut_ptr() as *mut u8;
-    let mut offset = 0;
-    let mut pages = 0;
-    while offset < bytes {
-        // SAFETY: `offset < bytes`, so the byte is in the spare capacity,
-        // which the vector holds as uninitialized memory it owns.
-        unsafe { std::ptr::write_volatile(base.add(offset), 0) };
-        pages += 1;
-        let addr = base as usize + offset;
-        offset = (addr / PAGE + 1) * PAGE - base as usize;
-    }
-    pages
 }
 
 #[cfg(target_os = "linux")]
@@ -156,8 +117,6 @@ mod linux {
     }
 
     pub fn madvise(addr: usize, len: usize, advice: i32) -> Result<(), i32> {
-        // SAFETY: the callers pass page-aligned ranges of mapped memory the
-        // process owns, and both advices leave every byte's value as it was.
         if unsafe { sys_madvise(addr as *mut c_void, len, advice) } == 0 {
             Ok(())
         } else {
@@ -169,17 +128,27 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::cell::RefCell;
 
-    static CALLS: Mutex<Vec<(usize, usize, i32)>> = Mutex::new(Vec::new());
+    thread_local! {
+        static CALLS: RefCell<Vec<(usize, usize, i32)>> = RefCell::new(Vec::new());
+    }
+
+    fn take_calls() -> Vec<(usize, usize, i32)> {
+        CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+
+    fn populates(calls: &[(usize, usize, i32)]) -> Vec<(usize, usize, i32)> {
+        calls.iter().copied().filter(|c| c.2 == MADV_POPULATE_WRITE).collect()
+    }
 
     fn record(addr: usize, len: usize, advice: i32) -> Result<(), i32> {
-        CALLS.lock().unwrap().push((addr, len, advice));
+        CALLS.with(|c| c.borrow_mut().push((addr, len, advice)));
         Ok(())
     }
 
     fn refuse_populate(addr: usize, len: usize, advice: i32) -> Result<(), i32> {
-        CALLS.lock().unwrap().push((addr, len, advice));
+        record(addr, len, advice)?;
         if advice == MADV_POPULATE_WRITE {
             Err(22)
         } else {
@@ -201,49 +170,80 @@ mod tests {
         vs.iter().map(|v| (v.clone(), v.capacity(), v.as_ptr() as usize)).collect()
     }
 
+    fn marked(count: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|_| {
+                let mut v = Vec::with_capacity(4 * MIN_SPARE);
+                for b in v.spare_capacity_mut() {
+                    b.write(0xA5);
+                }
+                v
+            })
+            .collect()
+    }
+
+    fn still_marked(vs: &mut [Vec<u8>]) -> bool {
+        vs.iter_mut().all(|v| v.spare_capacity_mut().iter().all(|b| unsafe { b.assume_init_read() } == 0xA5))
+    }
+
     #[test]
-    fn prefault_keeps_contents_and_covers_every_spare_range() {
-        for (advise, touched) in [(record as Advise, false), (refuse_populate as Advise, true)] {
-            CALLS.lock().unwrap().clear();
-            let mut vs = vectors_with_data();
-            let before = snapshot(&vs);
-            let stats = Stats::default();
-            prefault(&mut vs, advise, &stats);
-            assert_eq!(snapshot(&vs), before);
-            let calls = CALLS.lock().unwrap().clone();
-            let populates: Vec<_> = calls.iter().filter(|c| c.2 == MADV_POPULATE_WRITE).collect();
-            let with_spare = vs.iter().filter(|v| v.capacity() > v.len()).count();
-            if touched {
-                assert_eq!(populates.len(), 1, "populate is tried once, then every range is touched");
-                assert!(stats.populate_off.load(Ordering::Relaxed));
-                assert!(stats.touched_pages.load(Ordering::Relaxed) >= with_spare);
-            } else {
-                assert_eq!(populates.len(), with_spare);
-                assert_eq!(stats.touched_pages.load(Ordering::Relaxed), 0);
-                for v in &mut vs {
-                    if let Some((start, end)) = spare(v) {
-                        assert!(populates.iter().any(|&&(a, l, _)| a % PAGE == 0 && l % PAGE == 0 && a <= start && end <= a + l));
-                    }
-                }
-            }
-            for &(a, l, advice) in &calls {
-                if advice == MADV_HUGEPAGE {
-                    assert!(a % HUGE_PAGE == 0 && l % HUGE_PAGE == 0 && l > 0);
-                }
+    fn prefault_keeps_contents_and_covers_every_large_spare_range() {
+        take_calls();
+        let mut vs = vectors_with_data();
+        let before = snapshot(&vs);
+        let stats = Stats::default();
+        prefault(&mut vs, record, &stats);
+        assert_eq!(snapshot(&vs), before);
+        let calls = take_calls();
+        let populates = populates(&calls);
+        let ranges: Vec<(usize, usize)> = vs.iter_mut().filter_map(spare).collect();
+        assert_eq!((ranges.len(), populates.len()), (4, 4));
+        for (start, end) in ranges {
+            assert!(populates.iter().any(|&(a, l, _)| a % PAGE == 0 && l % PAGE == 0 && a <= start && end <= a + l));
+        }
+        assert_eq!(stats.populated.load(Ordering::Relaxed), populates.iter().map(|c| c.1).sum::<usize>());
+        for &(a, l, advice) in &calls {
+            if advice == MADV_HUGEPAGE {
+                assert!(a % HUGE_PAGE == 0 && l % HUGE_PAGE == 0 && l > 0);
             }
         }
     }
 
     #[test]
-    fn touch_reaches_every_page_of_the_spare_capacity() {
-        for (len, cap) in [(0usize, 1usize), (0, 512), (3, 513), (100, 5000), (0, 70_000)] {
-            let mut v: Vec<u64> = Vec::with_capacity(cap);
-            v.extend(0..len as u64);
-            let (start, end) = spare(&mut v).unwrap();
-            let want = (end - 1) / PAGE - start / PAGE + 1;
-            assert_eq!(touch(&mut v), want, "len {len} cap {cap}");
-            assert_eq!(v, (0..len as u64).collect::<Vec<_>>());
-        }
-        assert_eq!(touch(&mut Vec::<u64>::new()), 0);
+    fn vectors_with_little_spare_capacity_get_no_advice() {
+        take_calls();
+        let mut vs: Vec<Vec<u32>> = vec![Vec::with_capacity(16), Vec::with_capacity(MIN_SPARE / 4 - 1), Vec::with_capacity(MIN_SPARE / 4)];
+        let stats = Stats::default();
+        prefault(&mut vs, record, &stats);
+        let populates = populates(&take_calls());
+        assert!(spare(&mut vs[0]).is_none() && spare(&mut vs[1]).is_none());
+        let (start, end) = spare(&mut vs[2]).unwrap();
+        assert_eq!(populates.len(), 1);
+        assert!(populates[0].0 <= start && end <= populates[0].0 + populates[0].1);
+    }
+
+    #[test]
+    fn a_failed_populate_leaves_every_later_vector_to_demand_paging() {
+        take_calls();
+        let stats = Stats::default();
+        let mut first = marked(4);
+        prefault(&mut first, refuse_populate, &stats);
+        assert_eq!(populates(&take_calls()).len(), 1);
+        assert!(stats.populate_off.load(Ordering::Relaxed));
+        assert_eq!(stats.populate_errno.load(Ordering::Relaxed), 22);
+        let mut second = marked(4);
+        prefault(&mut second, record, &stats);
+        assert!(populates(&take_calls()).is_empty());
+        assert_eq!(stats.populated.load(Ordering::Relaxed), 0);
+        assert!(still_marked(&mut first) && still_marked(&mut second));
+    }
+
+    #[test]
+    fn the_report_counts_requested_mebibytes() {
+        let stats = Stats::default();
+        stats.populated.store((5 << 20) + PAGE, Ordering::Relaxed);
+        stats.populate_errno.store(22, Ordering::Relaxed);
+        stats.huge_ok.store(3, Ordering::Relaxed);
+        assert_eq!(line(&stats), "prefault: populate requests 5 MiB (populate errno 22), hugepage hints 3 ok 0 failed (errno 0)");
     }
 }
