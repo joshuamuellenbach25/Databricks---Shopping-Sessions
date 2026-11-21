@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::events::{transpose, Buckets, CHUNK, PERSON_BITS, PERSON_BUCKETS};
+use crate::events::{transpose, Buckets, CHUNK, PERSON_BITS, PERSON_BUCKETS, PREFETCH_AHEAD};
 use crate::ids::Key;
 use crate::lookups::{Campaigns, Window};
 use crate::people::People;
@@ -21,6 +21,7 @@ pub struct Context<'a> {
     pub people: &'a People,
 }
 
+/// A valid click with its user ID in `person`; the person is resolved later.
 fn parse_click(fields: &[&[u8]; 4], ctx: &Context) -> Option<Click> {
     if fields[0].is_empty() || fields[1].is_empty() {
         return None;
@@ -31,7 +32,7 @@ fn parse_click(fields: &[&[u8]; 4], ctx: &Context) -> Option<Click> {
     }
     let campaign = *ctx.campaigns.map.get(&Key::from_bytes(fields[2]))?;
     Some(Click {
-        person: ctx.people.name_of(Key::from_bytes(fields[1])),
+        person: Key::from_bytes(fields[1]),
         id: Key::from_bytes(fields[0]),
         ts,
         campaign,
@@ -43,17 +44,39 @@ fn parse_click(fields: &[&[u8]; 4], ctx: &Context) -> Option<Click> {
 /// click credits and assists exactly as one copy does.
 pub fn collect(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Result<Buckets<Click>> {
     let bytes = crate::scan::total_size(paths)? as usize;
-    let per_bucket = bytes / 45 / threads / PERSON_BUCKETS + 16;
+    let per_thread = bytes / 45 / threads + 16;
     let states = crate::scan::run_fields::<4, _, _, _>(
         paths,
         threads,
         CHUNK,
-        || (0..PERSON_BUCKETS).map(|_| Vec::<Click>::with_capacity(per_bucket)).collect::<Vec<_>>(),
+        || Vec::<Click>::with_capacity(per_thread),
         |state, fields| {
             if let Some(click) = parse_click(fields, ctx) {
-                state[click.person.bucket(PERSON_BITS)].push(click);
+                state.push(click);
             }
         },
     )?;
-    Ok(transpose(states))
+    let people = ctx.people;
+    let per_bucket = per_thread / PERSON_BUCKETS + 16;
+    let resolved: Vec<Vec<Vec<Click>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = states
+            .into_iter()
+            .map(|clicks| {
+                scope.spawn(move || {
+                    let mut out: Vec<Vec<Click>> = (0..PERSON_BUCKETS).map(|_| Vec::with_capacity(per_bucket)).collect();
+                    for (i, click) in clicks.iter().enumerate() {
+                        if let Some(ahead) = clicks.get(i + PREFETCH_AHEAD) {
+                            people.prefetch(ahead.person);
+                        }
+                        let mut click = *click;
+                        click.person = people.name_of(click.person);
+                        out[click.person.bucket(PERSON_BITS)].push(click);
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    Ok(transpose(resolved))
 }

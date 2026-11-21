@@ -18,7 +18,7 @@ pub const PERSON_BITS: u32 = 8;
 pub const PERSON_BUCKETS: usize = 1 << PERSON_BITS;
 pub const CHUNK: usize = 2 << 20;
 /// How many survivors ahead the person table slot is prefetched.
-const PREFETCH_AHEAD: usize = 16;
+pub const PREFETCH_AHEAD: usize = 16;
 
 /// One parsed line of events, before dedup.
 #[derive(Clone, Copy)]

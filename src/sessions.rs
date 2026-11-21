@@ -73,6 +73,8 @@ struct DayAgg {
 
 /// Scratch space reused across persons.
 pub struct Scratch {
+    /// Seconds this thread spent sorting events and clicks.
+    pub sort_seconds: f64,
     sessions: Vec<Session>,
     day_agg: Vec<DayAgg>,
     used_days: Vec<usize>,
@@ -83,6 +85,7 @@ pub struct Scratch {
 impl Scratch {
     pub fn new(days: usize) -> Scratch {
         Scratch {
+            sort_seconds: 0.0,
             sessions: Vec::new(),
             day_agg: (0..days).map(|_| DayAgg::default()).collect(),
             used_days: Vec::new(),
@@ -94,8 +97,10 @@ impl Scratch {
 
 /// Sessionizes, credits, assists and aggregates one bucket of persons.
 pub fn run_bucket(events: &mut [Event], clicks: &mut [Click], rules: &Rules, scratch: &mut Scratch, rows: &mut Vec<UserRow>, accum: &mut Accum) {
+    let started = std::time::Instant::now();
     events.sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)));
     clicks.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| a.id.cmp_bytes(b.id)));
+    scratch.sort_seconds += started.elapsed().as_secs_f64();
     let mut ci = 0;
     let mut i = 0;
     while i < events.len() {
