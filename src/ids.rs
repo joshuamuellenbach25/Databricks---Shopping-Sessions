@@ -6,7 +6,7 @@ use hashbrown::HashMap;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Key(pub u64);
 
-const PACKED_MAX: usize = 10;
+pub const PACKED_MAX: usize = 10;
 const LONG: u64 = 1 << 63;
 
 const fn code_table() -> [u8; 256] {
@@ -132,6 +132,16 @@ impl Key {
     pub fn to_vec(self) -> Vec<u8> {
         if self.0 & LONG == 0 {
             let mut out = Vec::with_capacity(PACKED_MAX);
+            self.append_to(&mut out);
+            out
+        } else {
+            let ids = long_ids().lock().unwrap();
+            ids.bytes[(self.0 & !LONG) as usize].clone()
+        }
+    }
+
+    pub fn append_to(self, out: &mut Vec<u8>) {
+        if self.0 & LONG == 0 {
             for i in (0..PACKED_MAX).rev() {
                 let code = ((self.0 >> (6 * i)) & 63) as usize;
                 if code == 0 {
@@ -139,10 +149,9 @@ impl Key {
                 }
                 out.push(BYTE[code]);
             }
-            out
         } else {
             let ids = long_ids().lock().unwrap();
-            ids.bytes[(self.0 & !LONG) as usize].clone()
+            out.extend_from_slice(&ids.bytes[(self.0 & !LONG) as usize]);
         }
     }
 
@@ -176,6 +185,18 @@ mod tests {
                 assert_eq!(Key::from_bytes(a).cmp_bytes(Key::from_bytes(b)), a.cmp(b), "{a:?} vs {b:?}");
                 assert_eq!(Key::from_bytes(a) == Key::from_bytes(b), a == b, "{a:?} vs {b:?}");
             }
+        }
+    }
+
+    #[test]
+    fn append_to_adds_the_bytes_of_packed_and_long_keys() {
+        let samples: Vec<&[u8]> = vec![b"", b"0", b"u1", b"zzzzzzzzzz", b"zzzzzzzzzzz", b"abcdefghijk", b"user_id_a\tuser_id_b", b"u\x00", b"p-1"];
+        let mut got = b"head".to_vec();
+        let mut want = b"head".to_vec();
+        for s in &samples {
+            Key::from_bytes(s).append_to(&mut got);
+            want.extend_from_slice(s);
+            assert_eq!(got, want, "{s:?}");
         }
     }
 
