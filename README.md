@@ -2,6 +2,23 @@
 
 A static Rust binary that reads a folder of messy click-stream CSV files (shop events, ad clicks, identity links and two lookup tables) and writes two exact Parquet tables: `user_daily` and `campaign_daily`. Team BackwardsDeployeds built it for the Databricks Shopping Sessions track of the Builders Buildathon, where the fastest exactly correct run wins.
 
+## The Buildathon
+
+The [Builders Buildathon](https://www.joinbuilders.org/buildathon) ran from November 20 to 22, 2026. Builders, a student-run nonprofit at Ohio State for startups and entrepreneurship, hosted it with an in-person kickoff and closing ceremony on campus and the option to take part fully online. Students from any school could enter, solo or in teams of up to two. Each of its four tracks offered a $5,000 prize, winner take all.
+
+The [Shopping Sessions track](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions), hosted by Databricks, was a speed contest:
+
+- An entry is a public GitHub repository with a Dockerfile at its root. The scorer builds and runs that container on the track's data, and both output tables must match the expected ones exactly.
+- The score is the container's run time. Lower wins, and equal times rank the earlier submission first.
+- During the event each team could submit twice an hour to a practice board timed on about 20 million events.
+- For the final, the chosen commit is rebuilt and timed three times on about 60 million new events, with a 3-minute cap per run.
+
+## Result
+
+- Best practice-board time: 0.85 s, for commit 8981d63, which the team entered as its final. The first submission scored 1.18 s, so the run time fell by 28 percent over the event.
+- Before the final, the entered build ran on 60 million generated events with a peak working set of 8.43 GiB and wrote tables identical to those of the previous best build.
+- [docs/STATUS.md](docs/STATUS.md) records each scored change and its measured effect.
+
 ## Input and output
 
 | Path | Contents |
