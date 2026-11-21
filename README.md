@@ -37,10 +37,12 @@ A static Rust binary that reads a folder of messy click-stream CSV files (shop e
 
 ## Build and run
 
+`make build` builds the Docker image for linux/amd64, `make test` runs the unit tests and `make fixtures` runs every fixture case through the image.
+
 ```sh
-make build       # Docker image for linux/amd64
-make test        # unit tests
-make fixtures    # every fixture case through the image
+make build
+make test
+make fixtures
 cargo build --release
 DATA_DIR=path/to/data OUTPUT_DIR=path/to/output target/release/solver
 ```
