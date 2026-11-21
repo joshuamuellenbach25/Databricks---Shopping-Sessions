@@ -110,14 +110,46 @@ impl<'a> Context<'a> {
         let last = (window.end - 1).div_euclid(DAY) + 6;
         Context { window, products, dates: timestamp::Months::new(first, last), catalog: Catalog::new(products) }
     }
+
+    #[inline(always)]
+    fn category(&self, product: &[u8]) -> u16 {
+        match numbered(product) {
+            Some(n) if self.catalog.numbered => match self.catalog.by_number.get(n) {
+                Some(&cat) if cat != ABSENT => cat,
+                _ => self.products.unknown,
+            },
+            _ => self.catalog.get(Key::from_bytes(product)).unwrap_or(self.products.unknown),
+        }
+    }
 }
 
 const VACANT: u64 = u64::MAX;
+const ABSENT: u16 = u16::MAX;
+
+#[inline(always)]
+fn numbered(b: &[u8]) -> Option<usize> {
+    match b {
+        [b'p', b'0'] => Some(0),
+        [b'p', first @ b'1'..=b'9', rest @ ..] if rest.len() < 6 => {
+            let mut n = usize::from(first - b'0');
+            for &c in rest {
+                if !c.is_ascii_digit() {
+                    return None;
+                }
+                n = n * 10 + usize::from(c - b'0');
+            }
+            Some(n)
+        }
+        _ => None,
+    }
+}
 
 struct Catalog {
     keys: Vec<u64>,
     cats: Vec<u16>,
     bits: u32,
+    by_number: Vec<u16>,
+    numbered: bool,
 }
 
 impl Catalog {
@@ -133,7 +165,22 @@ impl Catalog {
             keys[i] = key.0;
             cats[i] = cat;
         }
-        Catalog { keys, cats, bits }
+        let mut by_number = Vec::new();
+        let mut numbered = true;
+        let spelling = crate::ids::spelling();
+        let mut text = Vec::new();
+        for (&key, &cat) in &products.map {
+            text.clear();
+            spelling.append(key, &mut text);
+            if let Some(n) = self::numbered(&text) {
+                if n >= by_number.len() {
+                    by_number.resize(n + 1, ABSENT);
+                }
+                by_number[n] = cat;
+                numbered &= cat != ABSENT;
+            }
+        }
+        Catalog { keys, cats, bits, by_number, numbered }
     }
 
     #[inline(always)]
@@ -185,16 +232,30 @@ fn parse_price(b: &[u8]) -> Option<u32> {
 
 #[inline(always)]
 fn parse_event(fields: &[&[u8]; 7], ctx: &Context) -> Option<Raw> {
-    let event = fields[0];
-    if event.is_empty() {
+    if fields[0].is_empty() {
         return None;
     }
-    let ingest = ctx.dates.parse(fields[3]).unwrap_or(i64::MAX);
-    let user = fields[1];
-    let product = fields[5];
+    let ingest = ctx.dates.parse(fields[3]);
+    let ts = ctx.dates.parse(fields[2]);
+    Some(decode(fields, ctx, ts, ingest, (None, None)))
+}
+
+#[inline(always)]
+unsafe fn parse_event_wide(fields: &[&[u8]; 7], ctx: &Context) -> Option<Raw> {
+    if fields[0].is_empty() {
+        return None;
+    }
+    let (ts, ingest) = ctx.dates.pair(fields[2], fields[3]);
+    Some(decode(fields, ctx, ts, ingest, crate::ids::pack_two(fields[0], fields[1])))
+}
+
+#[inline(always)]
+fn decode(fields: &[&[u8]; 7], ctx: &Context, ts: Option<i64>, ingest: Option<i64>, keys: (Option<Key>, Option<Key>)) -> Raw {
+    let ingest = ingest.unwrap_or(i64::MAX);
+    let (event, user, product) = (fields[0], fields[1], fields[5]);
     let (typed, purchase) = event_type(fields[4]);
     let mut ok = !user.is_empty() & !product.is_empty() & typed;
-    let ts = match ctx.dates.parse(fields[2]) {
+    let ts = match ts {
         Some(t) if t >= ctx.window.start && t < ctx.window.end => {
             ok &= ingest.saturating_sub(t) <= DAY;
             (t - ctx.window.start) as i32
@@ -207,28 +268,25 @@ fn parse_event(fields: &[&[u8]; 7], ctx: &Context) -> Option<Raw> {
     let mut sale = Sale::NONE;
     if purchase && ok {
         match parse_price(fields[6]) {
-            Some(price) => {
-                let cat = ctx.catalog.get(Key::from_bytes(product)).unwrap_or(ctx.products.unknown);
-                sale = Sale::new(price, cat);
-            }
+            Some(price) => sale = Sale::new(price, ctx.category(product)),
             None => ok = false,
         }
     }
-    Some(Raw {
-        event: Key::from_bytes(event),
+    Raw {
+        event: keys.0.unwrap_or_else(|| Key::from_bytes(event)),
         ingest,
-        user: if ok { Key::from_bytes(user) } else { NO_USER },
+        user: if ok { keys.1.unwrap_or_else(|| Key::from_bytes(user)) } else { NO_USER },
         ts,
         sale,
-    })
+    }
 }
 
 const WAITING: usize = 8;
 
 struct Filer {
     buckets: Vec<Vec<Raw>>,
-    waiting: Vec<[Raw; WAITING]>,
-    counts: Vec<u8>,
+    waiting: Box<[[Raw; WAITING]; EVENT_BUCKETS]>,
+    counts: Box<[u8; EVENT_BUCKETS]>,
 }
 
 impl Filer {
@@ -238,22 +296,21 @@ impl Filer {
         EXIT_FENCE.with(|_| ());
         Filer {
             buckets: (0..EVENT_BUCKETS).map(|_| Vec::with_capacity(per_bucket)).collect(),
-            waiting: vec![[EMPTY; WAITING]; EVENT_BUCKETS],
-            counts: vec![0; EVENT_BUCKETS],
+            waiting: vec![[EMPTY; WAITING]; EVENT_BUCKETS].into_boxed_slice().try_into().ok().expect("one waiting row per bucket"),
+            counts: Box::new([0; EVENT_BUCKETS]),
         }
     }
 
     #[inline(always)]
     fn file(&mut self, raw: Raw) {
         let b = raw.event.bucket(EVENT_BITS);
-        let n = usize::from(self.counts[b]);
-        self.waiting[b][n] = raw;
-        if n + 1 < WAITING {
-            self.counts[b] = (n + 1) as u8;
-        } else {
-            self.counts[b] = 0;
+        let mut n = usize::from(self.counts[b]);
+        if n == WAITING {
             stream(&mut self.buckets[b], &self.waiting[b]);
+            n = 0;
         }
+        self.waiting[b][n & (WAITING - 1)] = raw;
+        self.counts[b] = (n + 1) as u8;
     }
 
     fn finish(mut self) -> Vec<Vec<Raw>> {
@@ -314,15 +371,26 @@ fn stream(bucket: &mut Vec<Raw>, waiting: &[Raw; WAITING]) {
     bucket.extend_from_slice(waiting);
 }
 
+struct Filing<'c, 'p> {
+    filer: Filer,
+    ctx: &'c Context<'p>,
+}
+
+impl crate::scan::EventSink for Filing<'_, '_> {
+    #[inline(always)]
+    fn line(&mut self, fields: &[&[u8]; 7], wide: bool) {
+        let raw = if wide { unsafe { parse_event_wide(fields, self.ctx) } } else { parse_event(fields, self.ctx) };
+        if let Some(raw) = raw {
+            self.filer.file(raw);
+        }
+    }
+}
+
 pub fn parse(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Result<Parsed> {
     let bytes = crate::scan::total_size(paths)? as usize;
     let per_bucket = bytes / 70 / threads / EVENT_BUCKETS + 16;
-    let states = crate::scan::run_events(paths, threads, CHUNK, || Filer::new(per_bucket), |state, fields| {
-        if let Some(raw) = parse_event(fields, ctx) {
-            state.file(raw);
-        }
-    })?;
-    Ok(states.into_iter().map(Filer::finish).collect())
+    let states = crate::scan::run_events(paths, threads, CHUNK, || Filing { filer: Filer::new(per_bucket), ctx })?;
+    Ok(states.into_iter().map(|state| state.filer.finish()).collect())
 }
 
 const SEEN_MIX: u64 = 0xA076_1D64_78BD_642F;
@@ -655,6 +723,61 @@ mod tests {
         }
     }
 
+    fn row(raw: Raw) -> (u64, i64, u64, i32, u32) {
+        (raw.event.0, raw.ingest, raw.user.0, raw.ts, raw.sale.to_bits())
+    }
+
+    #[test]
+    fn wide_parse_agrees_with_parse() {
+        let products = products(3);
+        let ctx = Context::new(window(), &products);
+        let ids = ["e1", "u1", "", "abcdefghij", "abcdefghijk", "U_9", "u 1", "p1", "p1", "e\r", "zzzzzzzzzz", "0", "e3sre588t", "u9wteausv", "\u{e9}"];
+        let stamps = [
+            "2026-10-03T10:00:00Z",
+            "2026-10-03T10:00:00Z",
+            "2026-10-03T10:05:00Z",
+            "2026-10-03T10:00:00+05:30",
+            "2026-10-03T10:00:00-04:00",
+            "1791071890000",
+            "0001791071890000",
+            "2026-10-15T00:00:00Z",
+            "2026-09-30T23:59:59Z",
+            "2026-10-03 10:00:00",
+            "",
+            "2026-10-03T24:00:00Z",
+            "2026-10-04T10:00:01Z",
+            "2026-02-30T00:00:00Z",
+            "x",
+        ];
+        let kinds = ["view", "cart", "purchase", "purchase", "Purchase", "cart ", ""];
+        let prices = ["", "0", "250", "0250", "10000000", "10000001", "1.5", "-5", "abc"];
+        let mut x: u64 = 3;
+        let mut next = move |below: usize| {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((x >> 33) % below as u64) as usize
+        };
+        let mut valid = 0;
+        for _ in 0..300_000 {
+            let texts: [&str; 7] = [
+                ids[next(ids.len())],
+                ids[next(ids.len())],
+                stamps[next(stamps.len())],
+                stamps[next(stamps.len())],
+                kinds[next(kinds.len())],
+                ids[next(ids.len())],
+                prices[next(prices.len())],
+            ];
+            let fill = [b'0', b'Z', b',', 0xFF, b'a', b'9', b':'][next(7)];
+            let buffers: Vec<Vec<u8>> = texts.iter().map(|t| [t.as_bytes(), &[fill; 32]].concat()).collect();
+            let fields: [&[u8]; 7] = std::array::from_fn(|i| &buffers[i][..texts[i].len()]);
+            let narrow = parse_event(&fields, &ctx);
+            let wide = unsafe { parse_event_wide(&fields, &ctx) };
+            assert_eq!(narrow.map(row), wide.map(row), "{texts:?}");
+            valid += usize::from(narrow.is_some_and(|r| r.ok()));
+        }
+        assert!(valid > 3_000, "{valid}");
+    }
+
     #[test]
     fn catalog_agrees_with_the_product_map() {
         let id = |i: usize| match i % 4 {
@@ -677,6 +800,49 @@ mod tests {
             }
             assert_eq!(found, count);
             assert_eq!(catalog.get(Key::from_bytes(b"")), None);
+        }
+    }
+
+    fn category_agrees(ctx: &Context, products: &Products, probe: &[u8]) {
+        let want = products.map.get(&Key::from_bytes(probe)).copied().unwrap_or(products.unknown);
+        assert_eq!(ctx.category(probe), want, "{:?}", String::from_utf8_lossy(probe));
+    }
+
+    #[test]
+    fn category_agrees_with_the_product_map() {
+        let odd = ["P1", "p01", "p_1", "x5", "p1234567", "pp", "product_number_7", "p", "q1", "p0000001", "p00", "abcdefghijklmnop"];
+        let probes = ["p2", "p0 ", " p1", "p1\r", "p1000000", "p9999999", "", "P7", "p-1", "p1.0", "p50001", "p100000", "p12", "p999999", "p\u{e9}"];
+        for shape in 0..3 {
+            let mut map = HashMap::new();
+            for n in 0..50_000u32 {
+                if n % 7 != 3 {
+                    map.insert(Key::from_bytes(format!("p{n}").as_bytes()), (n % 20) as u16);
+                }
+            }
+            for (i, name) in odd.iter().enumerate() {
+                map.insert(Key::from_bytes(name.as_bytes()), 20 + i as u16);
+            }
+            match shape {
+                1 => {
+                    map.insert(Key::from_bytes(b"p999999"), 3);
+                }
+                2 => {
+                    map.insert(Key::from_bytes(b"p17"), ABSENT);
+                }
+                _ => {}
+            }
+            let products = Products { map, categories: Vec::new(), unknown: 40, rank: Vec::new() };
+            let ctx = Context::new(window(), &products);
+            assert_eq!(ctx.catalog.numbered, shape != 2);
+            for name in odd.iter().chain(probes.iter()) {
+                category_agrees(&ctx, &products, name.as_bytes());
+            }
+            for n in (0..1_100_000).step_by(if shape == 0 { 1 } else { 37 }) {
+                category_agrees(&ctx, &products, format!("p{n}").as_bytes());
+                if n % 101 == 0 {
+                    category_agrees(&ctx, &products, format!("p0{n}").as_bytes());
+                }
+            }
         }
     }
 

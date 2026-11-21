@@ -137,6 +137,78 @@ fn pack(b: &[u8]) -> Option<Key> {
     (nonzero == leading).then_some(Key(value))
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+const fn nibble_tables() -> [[u8; 16]; 3] {
+    let mut tables = [[0u8; 16]; 3];
+    let mut n = 0;
+    while n < 16 {
+        let mut low = 0x10;
+        if n >= 10 {
+            low |= 0x01;
+        }
+        if n == 0 {
+            low |= 0x02;
+        }
+        if n >= 11 && n <= 14 {
+            low |= 0x04;
+        }
+        if n >= 11 {
+            low |= 0x08;
+        }
+        tables[0][n] = low;
+        let (high, shift): (u8, i32) = match n {
+            3 => (0x01, -47),
+            4 => (0x02, -54),
+            5 => (0x04, -54),
+            6 => (0x02, -59),
+            7 => (0x08, -59),
+            _ => (0x10, 0),
+        };
+        tables[1][n] = high;
+        tables[2][n] = shift as u8;
+        n += 1;
+    }
+    tables
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+static NIBBLES: [[u8; 16]; 3] = nibble_tables();
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+static PREFIX: [u8; 32] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+pub unsafe fn pack_two(a: &[u8], b: &[u8]) -> (Option<Key>, Option<Key>) {
+    use std::arch::x86_64::*;
+    let pair = |x: *const u8, y: *const u8| _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(_mm_loadu_si128(x.cast())), _mm_loadu_si128(y.cast()));
+    let table = |t: &[u8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr().cast()));
+    let bytes = pair(a.as_ptr(), b.as_ptr());
+    let inside = pair(PREFIX.as_ptr().add(16 - a.len().min(16)), PREFIX.as_ptr().add(16 - b.len().min(16)));
+    let nibble = _mm256_set1_epi8(0x0F);
+    let low = _mm256_and_si256(bytes, nibble);
+    let high = _mm256_and_si256(_mm256_srli_epi16::<4>(bytes), nibble);
+    let bad = _mm256_and_si256(_mm256_and_si256(_mm256_shuffle_epi8(table(&NIBBLES[0]), low), _mm256_shuffle_epi8(table(&NIBBLES[1]), high)), inside);
+    let underscore = _mm256_and_si256(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'_' as i8)), _mm256_set1_epi8(4));
+    let codes = _mm256_and_si256(_mm256_sub_epi8(_mm256_add_epi8(bytes, _mm256_shuffle_epi8(table(&NIBBLES[2]), high)), underscore), inside);
+    let pairs = _mm256_maddubs_epi16(codes, _mm256_set1_epi16(0x0140));
+    let quads = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x0001_1000));
+    let top = _mm256_slli_epi64::<36>(quads);
+    let middle = _mm256_andnot_si256(_mm256_set1_epi64x(0xFFF), _mm256_srli_epi64::<20>(quads));
+    let tail = _mm256_srli_epi64::<12>(_mm256_srli_si256::<8>(quads));
+    let values = _mm256_or_si256(_mm256_or_si256(top, middle), tail);
+    let clean = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bad, _mm256_setzero_si256())) as u32;
+    (
+        (clean & 0xFFFF == 0xFFFF && a.len() <= PACKED_MAX).then_some(Key(_mm256_extract_epi64::<0>(values) as u64)),
+        (clean >> 16 == 0xFFFF && b.len() <= PACKED_MAX).then_some(Key(_mm256_extract_epi64::<2>(values) as u64)),
+    )
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+pub unsafe fn pack_two(a: &[u8], b: &[u8]) -> (Option<Key>, Option<Key>) {
+    (pack(a), pack(b))
+}
+
 impl Key {
     #[inline]
     pub fn from_bytes(b: &[u8]) -> Key {
@@ -266,6 +338,60 @@ mod tests {
             }
         }
         assert_eq!(packed, 1 + PACKED_MAX + 63 * 55);
+    }
+
+    fn agree_two(a: &[u8], b: &[u8], fill: u8) {
+        let padded = |id: &[u8]| [id, &[fill; 32]].concat();
+        let (x, y) = (padded(a), padded(b));
+        let got = unsafe { pack_two(&x[..a.len()], &y[..b.len()]) };
+        assert_eq!(got, (pack(a), pack(b)), "{a:?} {b:?} fill {fill}");
+    }
+
+    #[test]
+    fn pack_two_agrees_with_pack_on_every_byte_at_every_position() {
+        let base = b"azAZ09_m5QxB7";
+        let fills = [b'a', b'0', b'_', b'"', b',', 0x00, 0xFF, b'Z', b'z', b'9'];
+        let mut checked = 0;
+        for len in 0..=base.len() {
+            let other = &base[base.len() - len..];
+            agree_two(&base[..len], other, fills[len % fills.len()]);
+            for at in 0..len {
+                for c in 0..=255u8 {
+                    let mut id = base[..len].to_vec();
+                    id[at] = c;
+                    agree_two(&id, other, fills[checked % fills.len()]);
+                    agree_two(other, &id, fills[(checked + 3) % fills.len()]);
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 256 * (1..=base.len()).sum::<usize>());
+    }
+
+    #[test]
+    fn pack_two_agrees_with_pack_on_random_ids() {
+        let alphabet = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+        let edges = [0x00, 0x09, 0x0D, b' ', b'"', b',', b'-', b'/', b':', b'@', b'[', b'^', b'`', b'{', 0x7F, 0x80, 0xFF];
+        let mut x: u64 = 7;
+        let mut next = move |below: usize| {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((x >> 33) % below as u64) as usize
+        };
+        let mut packed = 0;
+        for _ in 0..300_000 {
+            let mut ids: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+            for id in ids.iter_mut() {
+                let len = next(PACKED_MAX + 4);
+                for _ in 0..len {
+                    let c = if next(12) == 0 { edges[next(edges.len())] } else { alphabet[next(alphabet.len())] };
+                    id.push(c);
+                }
+            }
+            let fill = if next(2) == 0 { alphabet[next(alphabet.len())] } else { edges[next(edges.len())] };
+            agree_two(&ids[0], &ids[1], fill);
+            packed += usize::from(pack(&ids[0]).is_some());
+        }
+        assert!(packed > 50_000, "{packed}");
     }
 
     #[test]

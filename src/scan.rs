@@ -120,35 +120,39 @@ const EVENT_FIELDS: usize = 7;
 const EVENT_BATCH: usize = 16;
 const SEP_SLOTS: usize = 64 * EVENT_BATCH + 16;
 const NEWLINE_SLOTS: usize = 64 * EVENT_BATCH + 4;
+const WIDE: usize = 32;
 
-pub fn run_events<S, I, F>(paths: &[PathBuf], threads: usize, chunk: usize, init: I, f: F) -> io::Result<Vec<S>>
-where
-    S: Send,
-    I: Fn() -> S + Sync,
-    F: Fn(&mut S, &[&[u8]; EVENT_FIELDS]) + Sync,
-{
-    run_tasks(paths, threads, chunk, init, |state, data, start, end| events(data, start, end, state, &f))
+pub trait EventSink {
+    fn line(&mut self, fields: &[&[u8]; EVENT_FIELDS], wide: bool);
 }
 
-fn events<'a, S>(data: &'a [u8], start: usize, end: usize, state: &mut S, f: &impl Fn(&mut S, &[&[u8]; EVENT_FIELDS])) {
+pub fn run_events<S, I>(paths: &[PathBuf], threads: usize, chunk: usize, init: I) -> io::Result<Vec<S>>
+where
+    S: EventSink + Send,
+    I: Fn() -> S + Sync,
+{
+    run_tasks(paths, threads, chunk, init, |state, data, start, end| events(data, start, end, state))
+}
+
+fn events<'a, S: EventSink>(data: &'a [u8], start: usize, end: usize, state: &mut S) {
     let Some(mut at) = first_line(data, start) else {
         return;
     };
     if at < end {
-        at = event_blocks(data, at, end, state, f);
+        at = event_blocks(data, at, end, state);
     }
     let mut out: [&'a [u8]; EVENT_FIELDS] = [&[]; EVENT_FIELDS];
     while at < end {
         let (len, ok) = split_line(data, at, &mut out);
         if ok {
-            f(state, &out);
+            state.line(&out, at + len + WIDE <= data.len());
         }
         at += len + 1;
     }
 }
 
 #[inline(always)]
-fn event_blocks<'a, S>(data: &'a [u8], mut line: usize, end: usize, state: &mut S, f: &impl Fn(&mut S, &[&[u8]; EVENT_FIELDS])) -> usize {
+fn event_blocks<'a, S: EventSink>(data: &'a [u8], mut line: usize, end: usize, state: &mut S) -> usize {
     let mut seps = [0usize; SEP_SLOTS];
     let mut newlines = [0usize; NEWLINE_SLOTS];
     let mut wrong = [0usize; 64 * EVENT_BATCH];
@@ -163,7 +167,7 @@ fn event_blocks<'a, S>(data: &'a [u8], mut line: usize, end: usize, state: &mut 
         while blocks < EVENT_BATCH && block + 64 <= data.len() {
             let m = unsafe { masks(base.add(block)) };
             let sep = m.comma | m.newline;
-            let next = data.get(block + 64).map_or(1, |&c| u64::from(c == b',' || c == b'\n'));
+            let next = if m.quote >> 63 == 0 { 0 } else { data.get(block + 64).map_or(1, |&c| u64::from(c == b',' || c == b'\n')) };
             let after = (sep << 1) | sep_carry;
             let before = (sep >> 1) | (next << 63);
             let (sum, low) = (!sep).overflowing_add(m.quote & after);
@@ -224,7 +228,7 @@ fn event_blocks<'a, S>(data: &'a [u8], mut line: usize, end: usize, state: &mut 
                         from = to + 1;
                     }
                 }
-                f(state, &out);
+                state.line(&out, nl + WIDE <= data.len());
                 j += EVENT_FIELDS;
             } else {
                 while seps[j] != nl {
@@ -655,12 +659,35 @@ mod tests {
         rows.push(f.iter().map(|v| v.to_vec()).collect());
     }
 
+    impl EventSink for Rows {
+        fn line(&mut self, fields: &[&[u8]; EVENT_FIELDS], _wide: bool) {
+            push_event(self, fields);
+        }
+    }
+
+    struct WideCheck {
+        limit: usize,
+        wide: usize,
+        narrow: usize,
+    }
+
+    impl EventSink for WideCheck {
+        fn line(&mut self, fields: &[&[u8]; EVENT_FIELDS], wide: bool) {
+            if wide {
+                assert!(fields.iter().all(|v| v.as_ptr() as usize + WIDE <= self.limit), "a wide line too near the end");
+                self.wide += 1;
+            } else {
+                self.narrow += 1;
+            }
+        }
+    }
+
     fn events_tokenized(text: &[u8], chunk: usize) -> Rows {
         let mut rows = Vec::new();
         let mut start = 0;
         while start < text.len() {
             let end = text.len().min(start.saturating_add(chunk));
-            events(text, start, end, &mut rows, &push_event);
+            events(text, start, end, &mut rows);
             start = end;
         }
         rows
@@ -861,11 +888,39 @@ mod tests {
             let mut want = Rows::new();
             fields(data, start, end, &mut want, &push_event);
             let mut got = Rows::new();
-            events(data, start, end, &mut got, &push_event);
+            events(data, start, end, &mut got);
             assert!(got == want, "piece {a}..{b}, start {start}, end {end}: {} rows, want {}", got.len(), want.len());
             compared += want.len();
         }
         assert!(compared > 100_000, "{compared} rows compared");
+    }
+
+    #[test]
+    fn wide_lines_leave_room_to_read_past_every_field() {
+        let mut rng = Rng(5);
+        let mut text = b"h\n".to_vec();
+        for i in 0..3000 {
+            let line = if rng.below(3) == 0 { random_line(&mut rng, EVENT_FIELDS) } else { event_like(&mut rng, i) };
+            text.extend_from_slice(&line);
+            text.push(b'\n');
+        }
+        let (mut wide, mut narrow) = (0, 0);
+        for cut in [0, 1, 5, 31, 32, 33, 40, 100, 300] {
+            let data = &text[..text.len() - cut];
+            let limit = data.as_ptr() as usize + data.len();
+            for chunk in [64, 1000, usize::MAX] {
+                let mut start = 0;
+                while start < data.len() {
+                    let end = data.len().min(start.saturating_add(chunk));
+                    let mut check = WideCheck { limit, wide: 0, narrow: 0 };
+                    events(data, start, end, &mut check);
+                    wide += check.wide;
+                    narrow += check.narrow;
+                    start = end;
+                }
+            }
+        }
+        assert!(wide > 20_000 && narrow > 0, "{wide} wide, {narrow} narrow");
     }
 
     fn sorted(states: Vec<Rows>) -> Rows {
@@ -912,7 +967,7 @@ mod tests {
             for threads in [1, 3] {
                 let want = sorted(run_fields::<EVENT_FIELDS, _, _, _>(&paths, threads, chunk, Vec::new, push_event).unwrap());
                 assert!(want.len() > 3500, "chunk {chunk}: {} rows", want.len());
-                let got = sorted(run_events(&paths, threads, chunk, Vec::new, push_event).unwrap());
+                let got = sorted(run_events(&paths, threads, chunk, Vec::new).unwrap());
                 assert!(got == want, "chunk {chunk}, threads {threads}: {} rows, want {}", got.len(), want.len());
             }
         }

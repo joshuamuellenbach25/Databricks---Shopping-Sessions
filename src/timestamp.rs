@@ -89,6 +89,113 @@ impl Months {
         let ms = self.civil(b.first_chunk()?)?;
         offset(b, ms)
     }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline(always)]
+    unsafe fn clocks(ts: &[u8], ingest: &[u8]) -> (u32, u64, u64) {
+        use std::arch::x86_64::*;
+        let lanes = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(_mm_loadu_si128(ts.as_ptr().add(4).cast())), _mm_loadu_si128(ingest.as_ptr().add(4).cast()));
+        let t = _mm256_xor_si256(lanes, _mm256_setr_epi8(0, 0, 0, 0, 48, 48, 84, 48, 48, 58, 48, 48, 58, 48, 48, 0, 0, 0, 0, 0, 48, 48, 84, 48, 48, 58, 48, 48, 58, 48, 48, 0));
+        let limit = _mm256_setr_epi8(-1, -1, -1, -1, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, -1, -1, -1, -1, -1, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, -1);
+        let shaped = _mm256_cmpeq_epi8(_mm256_max_epu8(t, limit), limit);
+        let figures = _mm256_shuffle_epi8(t, _mm256_setr_epi8(4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1));
+        let values = _mm256_maddubs_epi16(figures, _mm256_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0));
+        let over = _mm256_cmpgt_epi16(values, _mm256_setr_epi16(99, 23, 59, 59, 0, 0, 0, 0, 99, 23, 59, 59, 0, 0, 0, 0));
+        let good = _mm256_movemask_epi8(_mm256_andnot_si256(over, shaped)) as u32;
+        let parts = _mm256_madd_epi16(values, _mm256_setr_epi16(24, 1, 60, 1, 0, 0, 0, 0, 24, 1, 60, 1, 0, 0, 0, 0));
+        (good, _mm256_extract_epi64::<0>(parts) as u64, _mm256_extract_epi64::<2>(parts) as u64)
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline(always)]
+    pub unsafe fn pair(&self, ts: &[u8], ingest: &[u8]) -> (Option<i64>, Option<i64>) {
+        let (good, ts_parts, ingest_parts) = Self::clocks(ts, ingest);
+        let ingest = if ingest.len() == 20 && ingest[19] == b'Z' { self.finish(ingest, good >> 16 == 0xFFFF, ingest_parts) } else { self.parse(ingest) };
+        let ts = match self.flat(ts, good & 0xFFFF == 0xFFFF, ts_parts) {
+            Some(value) => value,
+            None => self.parse(ts),
+        };
+        (ts, ingest)
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline(always)]
+    pub unsafe fn pair_branchy(&self, ts: &[u8], ingest: &[u8]) -> (Option<i64>, Option<i64>) {
+        let (good, ts_parts, ingest_parts) = Self::clocks(ts, ingest);
+        let ingest = if ingest.len() == 20 && ingest[19] == b'Z' { self.finish(ingest, good >> 16 == 0xFFFF, ingest_parts) } else { self.parse(ingest) };
+        let clock = good & 0xFFFF == 0xFFFF;
+        let ts = match ts.len() {
+            20 if ts[19] == b'Z' => self.finish(ts, clock, ts_parts),
+            25 if ts[19] == b'+' || ts[19] == b'-' => self.finish(ts, clock, ts_parts).and_then(|ms| offset(ts.first_chunk()?, ms)),
+            _ => digits(ts),
+        };
+        (ts, ingest)
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline(always)]
+    unsafe fn flat(&self, ts: &[u8], clock: bool, parts: u64) -> Option<Option<i64>> {
+        let (p, n) = (ts.as_ptr(), ts.len());
+        let tail = *p.add(19);
+        let f1 = (n == 20) & (tail == b'Z');
+        let f2 = (n == 25) & ((tail == b'+') | (tail == b'-'));
+        let dated = f1 | f2;
+        let short = (9..=16).contains(&n);
+        let word = p.cast::<u64>().read_unaligned();
+        let (in0, in1, in2) = (word == self.words[0], word == self.words[1], word == self.words[2]);
+        let k = if in2 { 2 } else { usize::from(in1) };
+        let hours = i64::from(parts as u32);
+        let known = (in0 | in1 | in2) & (hours >= self.first[k] * 24) & (hours <= self.last[k] * 24 + 23);
+        if (dated & clock & !known) | (!dated & !short) {
+            return None;
+        }
+        let civil = self.day0[k] + hours * HOUR + i64::from((parts >> 32) as u32) * SECOND;
+        let (zone, zone_shaped) = fit_flag(p.add(17).cast::<u64>().read_unaligned(), &OFFSET);
+        let zone = pairs(zone);
+        let (zone_hours, zone_minutes) = (byte(zone, 3), byte(zone, 6));
+        let zone_ok = zone_shaped & (zone_hours <= 23) & (zone_minutes <= 59);
+        let shift = (zone_hours * 60 + zone_minutes) * MINUTE;
+        let zoned = if tail == b'-' { civil + shift } else { civil - shift };
+        let m = n.clamp(9, 16);
+        let cut = 8 * (16 - m) as u32;
+        let (high, high_ok) = fit_flag((word << cut) | (DIGITS.xor & !(u64::MAX << cut)), &DIGITS);
+        let (low, low_ok) = fit_flag(p.add(m - 8).cast::<u64>().read_unaligned(), &DIGITS);
+        let number = (eight(high) * 100_000_000 + eight(low)) as i64;
+        let value = if f1 {
+            civil
+        } else if f2 {
+            zoned
+        } else {
+            number
+        };
+        let valid = (f1 & clock) | (f2 & clock & zone_ok) | (!dated & high_ok & low_ok);
+        Some(valid.then_some(value))
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[inline(always)]
+    pub unsafe fn pair(&self, ts: &[u8], ingest: &[u8]) -> (Option<i64>, Option<i64>) {
+        (self.parse(ts), self.parse(ingest))
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline(always)]
+    fn finish(&self, b: &[u8], clock: bool, parts: u64) -> Option<i64> {
+        let word = load(b, 0);
+        let (in0, in1, in2) = (word == self.words[0], word == self.words[1], word == self.words[2]);
+        if !(in0 | in1 | in2) {
+            return civil_cold(b.first_chunk()?);
+        }
+        if !clock {
+            return None;
+        }
+        let k = if in2 { 2 } else { usize::from(in1) };
+        let hours = i64::from(parts as u32);
+        if hours < self.first[k] * 24 || hours > self.last[k] * 24 + 23 {
+            return civil_cold(b.first_chunk()?);
+        }
+        Some(self.day0[k] + hours * HOUR + i64::from((parts >> 32) as u32) * SECOND)
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
@@ -210,6 +317,13 @@ fn load(b: &[u8], at: usize) -> u64 {
 fn fit(word: u64, shape: &Shape) -> Option<u64> {
     let values = (word ^ shape.xor) & shape.keep;
     (((values | values.wrapping_add(shape.over)) & TOP_BITS) == 0).then_some(values)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn fit_flag(word: u64, shape: &Shape) -> (u64, bool) {
+    let values = (word ^ shape.xor) & shape.keep;
+    (values, ((values | values.wrapping_add(shape.over)) & TOP_BITS) == 0)
 }
 
 #[inline(always)]
@@ -848,5 +962,92 @@ mod tests {
             accepted += usize::from(months_agree(months, &text));
         }
         assert!(accepted > 500_000, "{accepted}");
+    }
+
+    fn pair_agrees(months: &Months, ts: &[u8], ingest: &[u8], fill: u8) {
+        let padded = |text: &[u8]| [text, &[fill; 24]].concat();
+        let (a, b) = (padded(ts), padded(ingest));
+        let got = unsafe { months.pair(&a[..ts.len()], &b[..ingest.len()]) };
+        assert_eq!(got, (months.parse(ts), months.parse(ingest)), "{:?} and {:?} with {months:?}", String::from_utf8_lossy(ts), String::from_utf8_lossy(ingest));
+    }
+
+    #[test]
+    fn pair_agrees_with_parse_on_every_byte_at_every_position() {
+        let templates = [&b"2025-07-31T23:59:59Z"[..], b"2026-02-01T00:00:00+05:30", b"2028-02-29T12:00:00-04:00", b"2028-01-01T00:00:00Z", b"2100-02-28T00:00:00Z", b"1752624000000", b"2026-01-31T12:00:00Z"];
+        for (months, _, _) in month_tables() {
+            for (i, template) in templates.iter().enumerate() {
+                let partner = templates[(i + 1) % templates.len()];
+                pair_agrees(&months, template, partner, b'0');
+                for at in 0..template.len() {
+                    for c in 0..=255u8 {
+                        let mut text = template.to_vec();
+                        text[at] = c;
+                        pair_agrees(&months, &text, partner, c);
+                        pair_agrees(&months, partner, &text, b'9');
+                    }
+                }
+            }
+            for len in 0..=26 {
+                pair_agrees(&months, &templates[1][..len.min(25)], &templates[0][..len.min(20)], b'0');
+            }
+        }
+    }
+
+    #[test]
+    fn pair_agrees_with_parse_on_every_date_and_time() {
+        let times: [&[u8]; 7] = [b"T00:00:00", b"T23:59:59", b"T12:34:56", b"T24:00:00", b"T23:60:00", b"T23:59:60", b"t12:34:56"];
+        let zones: [&[u8]; 7] = [b"Z", b"+00:00", b"-10:00", b"+12:00", b"+23:59", b"-24:00", b"+05:60"];
+        for (months, _, _) in month_tables() {
+            let mut accepted = 0;
+            for year in [2025, 2026, 2027, 2028, 2100] {
+                for month in 0..=13 {
+                    for day in 0..=32 {
+                        let date = format!("{year:04}-{month:02}-{day:02}");
+                        for time in times {
+                            for zone in zones {
+                                let text = [date.as_bytes(), time, zone].concat();
+                                pair_agrees(&months, &text, b"2026-01-31T12:00:00Z", b'0');
+                                pair_agrees(&months, b"1752624000000", &text, b'Z');
+                                accepted += usize::from(months.parse(&text).is_some());
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(accepted > 10_000, "{accepted}");
+        }
+    }
+
+    #[test]
+    fn pair_agrees_with_parse_on_random_inputs() {
+        let mut rng = Rng(71);
+        let tables = month_tables();
+        let fills = [b'0', b'9', b',', b'Z', b':', b'T', 0xFF];
+        let mut accepted = 0;
+        for _ in 0..1_000_000 {
+            let (months, from, to) = &tables[rng.below(tables.len())];
+            let mut texts: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+            for text in texts.iter_mut() {
+                let day = from - 3 + rng.below((to - from + 7).max(1) as usize) as i64;
+                let (year, month, date) = civil_from_days(day).unwrap_or((2026, 1, 1));
+                *text = format!("{year:04}-{month:02}-{date:02}T{:02}:{:02}:{:02}", rng.below(25), rng.below(61), rng.below(61)).into_bytes();
+                match rng.below(4) {
+                    0 | 1 => text.push(b'Z'),
+                    2 => text.extend(format!("{}{:02}:{:02}", if rng.below(2) == 0 { '+' } else { '-' }, rng.below(25), rng.below(61)).bytes()),
+                    _ => *text = (day * DAY + rng.below(DAY as usize) as i64).to_string().into_bytes(),
+                }
+                if rng.below(4) == 0 {
+                    let at = rng.below(text.len());
+                    text[at] = [b'0', b'9', b':', b'-', b'T', b'Z', b'x', 0x00, 0xFF][rng.below(9)];
+                }
+                if rng.below(16) == 0 {
+                    let keep = rng.below(text.len() + 1);
+                    text.truncate(keep);
+                }
+            }
+            pair_agrees(months, &texts[0], &texts[1], fills[rng.below(fills.len())]);
+            accepted += usize::from(months.parse(&texts[0]).is_some() && months.parse(&texts[1]).is_some());
+        }
+        assert!(accepted > 300_000, "{accepted}");
     }
 }
