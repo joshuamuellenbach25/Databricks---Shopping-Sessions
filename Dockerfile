@@ -10,4 +10,7 @@ FROM scratch
 COPY --from=build /src/target/release/solver /solver
 USER 1000:1000
 ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch
+# Ask the allocator for transparent huge pages and commit its arenas up front,
+# so the large record buffers take far fewer page faults.
+ENV MIMALLOC_ALLOW_LARGE_OS_PAGES=1 MIMALLOC_ARENA_EAGER_COMMIT=1
 CMD ["/solver"]
