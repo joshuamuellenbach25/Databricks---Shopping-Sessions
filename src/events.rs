@@ -374,6 +374,9 @@ impl Filing {
     fn file_if(&mut self, event: Event, take: bool) {
         let bucket = event.person.bucket(PERSON_BITS);
         if self.open[bucket].len() == self.open[bucket].capacity() {
+            if !take {
+                return;
+            }
             self.rotate(bucket);
         }
         let current = &mut self.open[bucket];
@@ -881,5 +884,38 @@ mod dedup_tests {
                 assert_eq!(got, want, "order {order:?}");
             }
         }
+    }
+
+    #[test]
+    fn skipped_events_reserve_no_chunk() {
+        let name = key("a");
+        let aliases: Vec<Key> = (0..2 * PERSON_BUCKETS).map(|i| key(&format!("u{i}"))).collect();
+        let people = People::build(aliases.iter().map(|&alias| (alias, name)), aliases.len());
+        let raws: Vec<Raw> = aliases.iter().enumerate().map(|(i, &user)| Raw { event: key(&format!("e{i}")), ingest: i as i64, user, ts: i as i32, sale: Sale::NONE }).collect();
+        let states = parsed(&raws, 2);
+        let mut filing = Filing::new(4);
+        let mut sieve = Sieve::new();
+        for b in 0..EVENT_BUCKETS {
+            let parts: Vec<Vec<Raw>> = states.iter().map(|state| state[b].clone()).collect();
+            sieve.file(&parts, &people, &mut filing);
+        }
+        let home = name.bucket(PERSON_BITS);
+        for (bucket, open) in filing.open.iter().enumerate() {
+            assert!(bucket == home || open.capacity() == 0, "bucket {bucket} reserved {} slots for skipped events", open.capacity());
+        }
+        assert_eq!(filing.finish()[home].iter().map(Vec::len).sum::<usize>(), aliases.len());
+        let person = key("u1");
+        let b = person.bucket(PERSON_BITS);
+        let mut filing = Filing::new(4);
+        let mut n = 0;
+        while n == 0 || filing.open[b].len() < filing.open[b].capacity() {
+            filing.file_if(Event { person, ts: n, sale: Sale::NONE }, true);
+            n += 1;
+        }
+        filing.file_if(Event { person, ts: -1, sale: Sale::NONE }, false);
+        assert_eq!((filing.open[b].len(), filing.full[b].len()), (n as usize, 0), "a skipped event rotated a full chunk");
+        filing.file_if(Event { person, ts: n, sale: Sale::NONE }, true);
+        let chunks: Vec<Vec<i32>> = filing.finish()[b].iter().map(|chunk| chunk.iter().map(|e| e.ts).collect()).collect();
+        assert_eq!(chunks, vec![(0..n).collect::<Vec<i32>>(), vec![n]]);
     }
 }
