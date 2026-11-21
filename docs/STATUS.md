@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 07:03 UTC.
+Updated 2026-11-21 07:10 UTC.
 
 | Item | Value |
 |---|---|
@@ -15,7 +15,8 @@ Updated 2026-11-21 07:03 UTC.
 |---|---|---|
 | opt/parse2 | event parse stage redesign (53 percent of runtime), comments stripped | gates pass (79a758b); pinned bench median 1049 ms against 1121 ms for the best scored code; scored 1.04 s (receipt BB-C3C3BBDE); merged into main |
 | opt/people2 | linked-ID build in parts on several threads | b88353f; gates pass; people phase 0.227 s to 0.020 s in a pinned 16-round bench; Codex review running |
-| opt/cand2 | main plus the opt/people2 change, comments stripped | 0d40115; gates and Codex review running |
+| opt/cand2 | main plus the opt/people2 change, comments stripped | 0d40115; gates pass; Codex found no output defect; pinned bench median 1067 ms against 1070 ms for main, faster in 6 of 15 low-load rounds; not submitted |
+| opt/main-fix1 | quoted CPU pinning in the volume runner, no comment lines in Cargo.lock | 566828a; gates and Codex re-review running |
 | opt/directio | Linux input reads that skip the page cache when the data is not resident, overlapped with parsing | building |
 | opt/sessions2 | sessions and output rewrite (25 percent of runtime) | building, gates running |
 | opt/nocomments | remove code comments from the shipped files with a parser | superseded: the parse2 merge removed every comment from main (parser check: 0 left) |
