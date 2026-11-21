@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 14:02 UTC.
+Updated 2026-11-21 14:03 UTC.
 
 | Item | Value |
 |---|---|
@@ -38,6 +38,7 @@ Updated 2026-11-21 14:02 UTC.
 | opt/cand11 | the 0.91 s main plus the opt/sessions4 change (same patch) | ba252b8; gates pass (57 tests, 36/36, dev MATCH, 6/6); sessions and output 324 to 254 ms (lower in 14 of 16 rounds); pinned bench median 1427 ms against 1547 ms for the 0.91 s build, faster in 11 of 15 rounds; file creates and renames unchanged; 60M output identical, sessions and output 0.547 s against 0.591 s, clicks 0.287 s against 0.270 s; Codex review of the same patch running |
 | opt/dedup3 | CPU work of the events dedup phase (0.570 s of a 2.926 s run at 60M events) on the 0.91 s main, user and kernel time measured apart | lane building |
 | opt/scan3 | user CPU of the events scan (0.629 s of a 1.152 s fast run at 20M events) on the 0.85 s main, user and kernel time measured apart | lane building |
+| opt/tests1 | the opt/sessions4 credit-tie test fix plus a smallest-first tie, tests only, on the 0.85 s main | lane building |
 | opt/cand12 | opt/cand10 plus the opt/sessions4 change (same patch) | ba56144; gates pass (69 tests, 36/36, dev MATCH, 6/6); sessions and output 217 to 139 ms (lower in 12 of 16 rounds); pinned bench median 1644 ms against 1520 ms for the 0.91 s build, faster in 4 of 15 rounds: fails the bench rule, not submitted; 60M output identical, but that run was slow in the events phase (5.054 s against 1.892 s), which cand12 shares with cand10 (1.537 s in its own 60M run) |
 | opt/cand4 | the 1.04 s main plus the opt/directio change, comments stripped | 51d0233; gates pass on Windows (55 tests, 36/36, dev MATCH, 6/6); Codex confirmed 1 item (overlay mounts refuse the read probe; fixed: unknown residency now reads directly), 0 left; the Linux code is not compiled here; needs a port onto the 0.96 s main |
 | opt/cand3 | main plus only the opt/sessions2 change, comments stripped | 0890fe7; gates pass (48 tests, 36/36, dev MATCH, 6/6); reference matched in 228 of 228 runs; Codex confirmed 5 items, none in a single fresh run (reused output folder, failed rerun, per-worker category copy, open file handles, a 2^31 event limit); fix 8643225 (output published only after a whole run, writer text no longer leaked); bench median 1738 ms against 1914 ms, 16 of 25 rounds; scored 0.96 s (receipt BB-FEAC4A51); merged into main |
