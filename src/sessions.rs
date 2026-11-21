@@ -852,12 +852,13 @@ mod tests {
         let products = Products { map: HashMap::new(), categories: vec![b"unknown".to_vec()], unknown: 0, rank: vec![0] };
         let rules = Rules { origin, base_day, products: &products };
         let start = (10 * HOUR) as i32;
-        let (few, many) = (Key::from_bytes(b"u1"), Key::from_bytes(b"u2"));
-        let events = vec![Event { person: few, ts: start, sale: Sale::NONE }, Event { person: many, ts: start, sale: Sale::NONE }];
+        let (few, many, third) = (Key::from_bytes(b"u1"), Key::from_bytes(b"u2"), Key::from_bytes(b"u3"));
+        let events = vec![Event { person: few, ts: start, sale: Sale::NONE }, Event { person: many, ts: start, sale: Sale::NONE }, Event { person: third, ts: start, sale: Sale::NONE }];
         let click = |person: Key, id: &str, ts: i32, campaign: u16| Click { person, id: Key::from_bytes(id.as_bytes()), ts, campaign };
         let mut clicks = Vec::new();
         clicks.extend([click(few, "k1", start - 10, 4), click(few, "k-2", start - 10, 3), click(few, "kz", start - 10, 1), click(few, "k0", start - 20, 2)]);
         clicks.extend([click(many, "k-2", start - 10, 3), click(many, "kz", start - 10, 1), click(many, "k1", start - 10, 4), click(many, "k0", start - 20, 2)]);
+        clicks.extend([click(third, "kz", start - 10, 1), click(third, "k1", start - 10, 4), click(third, "k-2", start - 10, 3), click(third, "k0", start - 20, 2)]);
         clicks.extend((0..64).map(|i| click(many, &format!("m{i}"), start - 1000 - i, 2)));
         clicks.reverse();
         let mut scratch = Scratch::new(5, days);
@@ -866,9 +867,9 @@ mod tests {
         run_bucket(&[events], &[clicks[..30].to_vec(), clicks[30..].to_vec()], &rules, &mut scratch, &mut rows, &mut counts).unwrap();
         let cells = cells(&counts, 5, days);
         let credited: Vec<i64> = (0..5).map(|c| cells[c * days].0).collect();
-        assert_eq!(credited, vec![0, 0, 0, 2, 0]);
+        assert_eq!(credited, vec![0, 0, 0, 3, 0]);
         let assisted: Vec<i64> = (0..5).map(|c| cells[c * days].3).collect();
-        assert_eq!(assisted, vec![0, 2, 2, 2, 2]);
+        assert_eq!(assisted, vec![0, 3, 3, 3, 3]);
     }
 
     #[test]
