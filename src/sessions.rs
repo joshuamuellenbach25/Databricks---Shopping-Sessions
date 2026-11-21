@@ -7,11 +7,21 @@ use crate::timestamp;
 const GAP: i32 = (30 * timestamp::MINUTE) as i32;
 const WEEK: i32 = timestamp::WEEK as i32;
 
-pub fn check_counts(events: usize) -> Result<(), String> {
-    if events > i32::MAX as usize {
-        return Err(format!("{events} surviving events; session and event counts are stored as int32, which holds at most {}", i32::MAX));
+pub fn check_events(taken: usize) -> Result<(), String> {
+    if taken > u32::MAX as usize {
+        return Err(format!("{taken} events in one sessions thread; its bucket offsets and campaign counts are u32, which holds at most {}", u32::MAX));
     }
     Ok(())
+}
+
+#[inline(always)]
+fn int32(value: i64, column: &str, person: Key, day: i32) -> Result<i32, String> {
+    i32::try_from(value).map_err(|_| too_large(value, column, person, day))
+}
+
+#[cold]
+fn too_large(value: i64, column: &str, person: Key, day: i32) -> String {
+    format!("user {} on day {day}: {value} {column} in one user_daily row; the column is int32, which holds at most {}", String::from_utf8_lossy(&person.to_vec()), i32::MAX)
 }
 
 #[derive(Default)]
@@ -211,7 +221,7 @@ struct Persons {
     numbers: Vec<u32>,
     shift: u32,
     list: Vec<Key>,
-    positions: Vec<u32>,
+    positions: Vec<usize>,
 }
 
 const PERSON_MIX: u64 = 0xFF51_AFD7_ED55_8CCD;
@@ -223,7 +233,7 @@ impl Persons {
             self.resize(MIN_POSITIONS);
         }
         for &position in &self.positions {
-            self.numbers[position as usize] = 0;
+            self.numbers[position] = 0;
         }
         self.list.clear();
         self.positions.clear();
@@ -279,13 +289,13 @@ impl Persons {
                 let at = self.free_position(self.list[n]);
                 self.keys[at] = self.list[n].0;
                 self.numbers[at] = n as u32 + 1;
-                self.positions[n] = at as u32;
+                self.positions[n] = at;
             }
             position = self.free_position(key);
         }
         self.keys[position] = key.0;
         self.list.push(key);
-        self.positions.push(position as u32);
+        self.positions.push(position);
         self.numbers[position] = self.list.len() as u32;
         self.list.len() - 1
     }
@@ -326,7 +336,7 @@ fn offsets(counts: &mut Vec<u32>) -> usize {
     total as usize
 }
 
-pub fn run_bucket(event_parts: &[Vec<Event>], click_parts: &[Vec<Click>], rules: &Rules, scratch: &mut Scratch, rows: &mut UserRows, counts: &mut Counts) {
+pub fn run_bucket(event_parts: &[Vec<Event>], click_parts: &[Vec<Click>], rules: &Rules, scratch: &mut Scratch, rows: &mut UserRows, counts: &mut Counts) -> Result<(), String> {
     let started = std::time::Instant::now();
     let Scratch { sort_seconds, person, group: g } = scratch;
     g.persons.clear();
@@ -347,7 +357,7 @@ pub fn run_bucket(event_parts: &[Vec<Event>], click_parts: &[Vec<Click>], rules:
     }
     let groups = g.event_off.len();
     if groups == 0 {
-        return;
+        return Ok(());
     }
     let total = offsets(&mut g.event_off);
     let bought = offsets(&mut g.purchase_off);
@@ -433,8 +443,9 @@ pub fn run_bucket(event_parts: &[Vec<Event>], click_parts: &[Vec<Click>], rules:
         if clicks.len() > INSERTED_CLICKS {
             clicks.sort_unstable_by(click_order);
         }
-        person_rows(g.persons.list[t], times, purchases, clicks, rules, person, rows, counts);
+        person_rows(g.persons.list[t], times, purchases, clicks, rules, person, rows, counts)?;
     }
+    Ok(())
 }
 
 const INSERTED_CLICKS: usize = 32;
@@ -457,7 +468,7 @@ fn range_bits(lo: usize, hi: usize) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], rules: &Rules, scratch: &mut PersonScratch, rows: &mut UserRows, counts: &mut Counts) {
+fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], rules: &Rules, scratch: &mut PersonScratch, rows: &mut UserRows, counts: &mut Counts) -> Result<(), String> {
     for &t in times {
         let s = slot_of(t);
         let slot = &mut scratch.slots[s];
@@ -637,9 +648,10 @@ fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], 
                 best = sum;
             }
         }
-        rows.days.push(rules.base_day + day as i32);
-        rows.sessions.push(agg.sessions as i32);
-        rows.events.push(agg.events as i32);
+        let date = rules.base_day + day as i32;
+        rows.days.push(date);
+        rows.sessions.push(int32(agg.sessions, "sessions", person, date)?);
+        rows.events.push(int32(agg.events, "events", person, date)?);
         rows.revenue.push(agg.revenue);
         match top {
             Some(cat) => {
@@ -655,6 +667,7 @@ fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], 
     }
     rows.persons.push((person, scratch.used_days.len() as u32));
     scratch.used_days.clear();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -710,7 +723,7 @@ mod tests {
         let mut scratch = Scratch::new(2, days);
         let mut rows = UserRows::default();
         let mut counts = Counts::new(2, days);
-        run_bucket(&[events], &[clicks], &rules, &mut scratch, &mut rows, &mut counts);
+        run_bucket(&[events], &[clicks], &rules, &mut scratch, &mut rows, &mut counts).unwrap();
         let got: Vec<(i32, i64, i64, i64, Option<u16>)> = user_rows(&rows).into_iter().map(|r| (r.1 - base_day, r.2, r.3, r.4, r.5)).collect();
         assert_eq!(got, vec![(0, 1, 2, 700, Some(0)), (2, 1, 1, 0, None)]);
         let cells = cells(&counts, 2, days);
@@ -733,15 +746,22 @@ mod tests {
         let mut scratch = Scratch::new(1, days);
         let mut rows = UserRows::default();
         let mut counts = Counts::new(1, days);
-        run_bucket(&[events], &[], &rules, &mut scratch, &mut rows, &mut counts);
+        run_bucket(&[events], &[], &rules, &mut scratch, &mut rows, &mut counts).unwrap();
         assert_eq!(user_rows(&rows), vec![(b"u1".to_vec(), base_day, 3, 6, 0, None)]);
         assert_eq!(cells(&counts, 1, days)[0], (3, 0, 0, 0));
     }
 
     #[test]
-    fn check_counts_refuses_more_events_than_int32_holds() {
-        assert!(check_counts(i32::MAX as usize).is_ok());
-        assert!(check_counts(i32::MAX as usize + 1).is_err());
+    fn counts_are_refused_only_where_a_32_bit_field_cannot_hold_them() {
+        let two_whales = 2 * (1usize << 30);
+        assert!(two_whales > i32::MAX as usize);
+        assert!(check_events(two_whales).is_ok());
+        assert!(check_events(u32::MAX as usize).is_ok());
+        assert!(check_events(u32::MAX as usize + 1).is_err());
+        let u1 = Key::from_bytes(b"u1");
+        assert_eq!(int32(i64::from(i32::MAX), "events", u1, 20_362), Ok(i32::MAX));
+        let refused = int32(i64::from(i32::MAX) + 1, "events", u1, 20_362).unwrap_err();
+        assert!(refused.contains("user u1 on day 20362") && refused.contains("events"), "{refused}");
     }
 
     #[test]
@@ -764,7 +784,7 @@ mod tests {
         let mut scratch = Scratch::new(5, days);
         let mut rows = UserRows::default();
         let mut counts = Counts::new(5, days);
-        run_bucket(&[events], &[clicks[..30].to_vec(), clicks[30..].to_vec()], &rules, &mut scratch, &mut rows, &mut counts);
+        run_bucket(&[events], &[clicks[..30].to_vec(), clicks[30..].to_vec()], &rules, &mut scratch, &mut rows, &mut counts).unwrap();
         let cells = cells(&counts, 5, days);
         let credited: Vec<i64> = (0..5).map(|c| cells[c * days].0).collect();
         assert_eq!(credited, vec![0, 0, 0, 2, 0]);
@@ -945,12 +965,12 @@ mod tests {
             let mut scratch = Scratch::new(campaigns, days);
             let mut rows = UserRows::default();
             let mut counts = Counts::new(campaigns, days);
-            run_bucket(&event_parts, &click_parts, &rules, &mut scratch, &mut rows, &mut counts);
+            run_bucket(&event_parts, &click_parts, &rules, &mut scratch, &mut rows, &mut counts).unwrap();
             assert_eq!(user_rows(&rows), want_rows, "seed {seed}");
             assert_eq!(cells(&counts, campaigns, days), want_cells, "seed {seed}");
             let mut again = UserRows::default();
             let mut counts_again = Counts::new(campaigns, days);
-            run_bucket(&event_parts, &click_parts, &rules, &mut scratch, &mut again, &mut counts_again);
+            run_bucket(&event_parts, &click_parts, &rules, &mut scratch, &mut again, &mut counts_again).unwrap();
             assert_eq!(user_rows(&again), want_rows, "seed {seed}, second run");
             assert_eq!(cells(&counts_again, campaigns, days), want_cells, "seed {seed}, second run");
         }
