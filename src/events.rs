@@ -101,7 +101,7 @@ pub struct Context<'a> {
     pub window: Window,
     pub products: &'a Products,
     dates: timestamp::Months,
-    catalog: Catalog,
+    catalog: Option<Catalog>,
 }
 
 impl<'a> Context<'a> {
@@ -110,9 +110,19 @@ impl<'a> Context<'a> {
         let last = (window.end - 1).div_euclid(DAY) + 6;
         Context { window, products, dates: timestamp::Months::new(first, last), catalog: Catalog::new(products) }
     }
+
+    #[inline(always)]
+    fn category(&self, product: Key) -> u16 {
+        let found = match &self.catalog {
+            Some(catalog) => catalog.get(product),
+            None => self.products.map.get(&product).copied(),
+        };
+        found.unwrap_or(self.products.unknown)
+    }
 }
 
 const VACANT: u64 = u64::MAX;
+const MAX_PROBES: usize = 64;
 
 struct Catalog {
     keys: Vec<u64>,
@@ -121,32 +131,32 @@ struct Catalog {
 }
 
 impl Catalog {
-    fn new(products: &Products) -> Catalog {
+    fn new(products: &Products) -> Option<Catalog> {
         let slots = (2 * products.map.len()).max(16).next_power_of_two();
         let bits = slots.trailing_zeros();
         let (mut keys, mut cats) = (vec![VACANT; slots], vec![0; slots]);
         for (&key, &cat) in &products.map {
-            let mut i = key.bucket(bits);
-            while keys[i] != VACANT {
-                i = (i + 1) & (slots - 1);
-            }
+            let home = key.bucket(bits);
+            let step = (0..MAX_PROBES).find(|step| keys[(home + step) & (slots - 1)] == VACANT)?;
+            let i = (home + step) & (slots - 1);
             keys[i] = key.0;
             cats[i] = cat;
         }
-        Catalog { keys, cats, bits }
+        Some(Catalog { keys, cats, bits })
     }
 
     #[inline(always)]
     fn get(&self, key: Key) -> Option<u16> {
         let mask = self.keys.len() - 1;
         let mut i = key.bucket(self.bits);
-        loop {
+        for _ in 0..MAX_PROBES {
             match self.keys[i] {
                 VACANT => return None,
                 k if k == key.0 => return Some(self.cats[i]),
                 _ => i = (i + 1) & mask,
             }
         }
+        None
     }
 }
 
@@ -208,7 +218,7 @@ fn parse_event(fields: &[&[u8]; 7], ctx: &Context) -> Option<Raw> {
     if purchase && ok {
         match parse_price(fields[6]) {
             Some(price) => {
-                let cat = ctx.catalog.get(Key::from_bytes(product)).unwrap_or(ctx.products.unknown);
+                let cat = ctx.category(Key::from_bytes(product));
                 sale = Sale::new(price, cat);
             }
             None => ok = false,
@@ -666,7 +676,7 @@ mod tests {
         for count in [0, 1, 7, 8, 9, 100, 50_000] {
             let map: HashMap<Key, u16> = (0..count).map(|i| (Key::from_bytes(id(i).as_bytes()), (i % 21) as u16)).collect();
             let products = Products { map, categories: Vec::new(), unknown: 21, rank: Vec::new() };
-            let catalog = Catalog::new(&products);
+            let Some(catalog) = Catalog::new(&products) else { panic!("{count} products: no catalog") };
             assert!(catalog.keys.len() >= 2 * count && catalog.keys.len().is_power_of_two());
             let mut found = 0;
             for i in 0..count + 3000 {
@@ -677,6 +687,60 @@ mod tests {
             }
             assert_eq!(found, count);
             assert_eq!(catalog.get(Key::from_bytes(b"")), None);
+        }
+    }
+
+    fn crowd(bits: u32, count: usize) -> Vec<String> {
+        let last = (1 << bits) - 1;
+        let ids: Vec<String> = (0..1_000_000).map(|i| format!("q{i}")).filter(|id| Key::from_bytes(id.as_bytes()).bucket(bits) == last).take(count).collect();
+        assert_eq!(ids.len(), count, "{bits} bits");
+        ids
+    }
+
+    #[test]
+    fn crowded_product_ids_fall_back_to_the_product_map() {
+        let named = ["01", "03", "0Y", "0_", "13", "15", "1_", "1b", "25"].map(String::from).to_vec();
+        for (ids, present) in [(named, 8), (crowd(7, 2 * MAX_PROBES), MAX_PROBES), (crowd(8, 2 * MAX_PROBES + 1), MAX_PROBES + 1)] {
+            let key = |id: &String| Key::from_bytes(id.as_bytes());
+            let bits = (2 * present).max(16).next_power_of_two().trailing_zeros();
+            assert!(ids.iter().all(|id| key(id).bucket(bits) == (1 << bits) - 1), "{present} products");
+            let map: HashMap<Key, u16> = ids[..present].iter().enumerate().map(|(i, id)| (key(id), (i % 20) as u16)).collect();
+            let products = Products { map, categories: Vec::new(), unknown: 21, rank: Vec::new() };
+            let catalog = Catalog::new(&products);
+            assert_eq!(catalog.is_some(), present <= MAX_PROBES, "{present} products");
+            if let Some(catalog) = &catalog {
+                assert_eq!(catalog.bits, bits);
+                for id in &ids {
+                    assert_eq!(catalog.get(key(id)), products.map.get(&key(id)).copied(), "{present} products, {id}");
+                }
+            }
+            let ctx = Context::new(window(), &products);
+            assert_eq!(ctx.catalog.is_some(), present <= MAX_PROBES, "{present} products");
+            for (i, id) in ids.iter().enumerate() {
+                let want = if i < present { (i % 20) as u16 } else { products.unknown };
+                assert_eq!(ctx.category(key(id)), want, "{present} products, {id}");
+                let buy = raw(&ctx, ["e1", "u1", "2026-10-03T10:00:00Z", "2026-10-03T10:00:05Z", "purchase", id.as_str(), "100"]);
+                assert_eq!((buy.sale.price(), buy.sale.cat()), (100, want), "{present} products, {id}");
+            }
+        }
+        let map: HashMap<Key, u16> = (1..=50_000).map(|i| (Key::from_bytes(format!("p{i}").as_bytes()), (i % 20) as u16)).collect();
+        assert!(Catalog::new(&Products { map, categories: Vec::new(), unknown: 21, rank: Vec::new() }).is_some());
+    }
+
+    #[test]
+    fn catalog_get_looks_at_most_max_probes_slots() {
+        let wanted = Key::from_bytes(b"p1");
+        let bits = 8;
+        let mask = (1usize << bits) - 1;
+        let home = wanted.bucket(bits);
+        for (at, want) in [(MAX_PROBES - 1, Some(7)), (MAX_PROBES, None)] {
+            let mut keys = vec![VACANT; mask + 1];
+            for step in 0..at {
+                keys[(home + step) & mask] = Key::from_bytes(format!("f{step}").as_bytes()).0;
+            }
+            keys[(home + at) & mask] = wanted.0;
+            let catalog = Catalog { keys, cats: vec![7; mask + 1], bits };
+            assert_eq!(catalog.get(wanted), want, "p1 {at} slots past its home");
         }
     }
 
