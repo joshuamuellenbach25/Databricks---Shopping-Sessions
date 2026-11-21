@@ -1,6 +1,4 @@
 #!/bin/sh
-# Run the image the way the scorer does: docker_run.sh DATA_DIR OUTPUT_DIR
-# Same flags as the scorer box, except the resource limits come from CPUS / MEM.
 set -eu
 IMAGE="${IMAGE:-shopping-sessions:latest}"
 CPUS="${CPUS:-8}"
@@ -10,9 +8,6 @@ DATA=$(cd "$1" && pwd)
 mkdir -p "$2"; OUT=$(cd "$2" && pwd)
 SCRATCH=$(mktemp -d)
 chmod 777 "$OUT" "$SCRATCH"
-# The run's files belong to uid 1000, as on the scorer. If that is not you (a
-# Linux user other than the first, a cloud VM, rootless Docker), you could not
-# delete them, so they are made writable for everyone before cleaning up.
 release() {
   if [ -n "$(find "$OUT" "$SCRATCH" ! -user "$(id -u)" -print -quit 2>/dev/null)" ]; then
     docker run --rm --platform "$PLATFORM" --network none --user 1000:1000 \

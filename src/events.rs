@@ -10,43 +10,31 @@ use crate::lookups::{Products, Window};
 use crate::people::People;
 use crate::timestamp::{self, DAY, WEEK};
 
-/// Buckets by event_id for dedup: small enough that each bucket's map stays in cache.
 pub const EVENT_BITS: u32 = 10;
 pub const EVENT_BUCKETS: usize = 1 << EVENT_BITS;
-/// Buckets by person for sessions.
 pub const PERSON_BITS: u32 = 8;
 pub const PERSON_BUCKETS: usize = 1 << PERSON_BITS;
 pub const CHUNK: usize = 2 << 20;
-/// How many survivors ahead the person table slot is prefetched.
 pub const PREFETCH_AHEAD: usize = 16;
 
-/// The user of a copy that fails a check or is late. A valid event's user ID
-/// is never empty, and only the empty ID packs to this key.
 const NO_USER: Key = Key(0);
 
-/// One parsed line of events, before dedup. `ts` is milliseconds from the
-/// window start; `ingest` keeps full epoch milliseconds because it alone
-/// decides which copy dedup keeps.
 #[derive(Clone, Copy)]
 pub struct Raw {
     pub event: Key,
     pub ingest: i64,
-    /// `NO_USER` unless the copy passes every check and is not late.
     pub user: Key,
     pub ts: i32,
     pub sale: Sale,
 }
 
 impl Raw {
-    /// Passes every validation check and is not late.
     #[inline]
     pub fn ok(&self) -> bool {
         self.user != NO_USER
     }
 }
 
-/// A surviving event, keyed by its person. `ts` is milliseconds from the
-/// window start.
 #[derive(Clone, Copy)]
 pub struct Event {
     pub person: Key,
@@ -54,16 +42,11 @@ pub struct Event {
     pub sale: Sale,
 }
 
-/// A purchase's price and category in one word: the price in the low 24 bits
-/// (a valid price is at most 10,000,000 cents, under 2^24) and the category
-/// in the high 8. A view or a cart is 0, which no purchase is, since its
-/// price is at least 1.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Sale(u32);
 
 const PRICE_BITS: u32 = 24;
 const PRICE_MASK: u32 = (1 << PRICE_BITS) - 1;
-/// The most categories, `unknown` included, that a `Sale` can name.
 pub const MAX_CATEGORIES: usize = 1 << (32 - PRICE_BITS);
 
 impl Sale {
@@ -94,10 +77,6 @@ impl Sale {
 const _: () = assert!(std::mem::size_of::<Raw>() == 32);
 const _: () = assert!(std::mem::size_of::<Event>() == 16);
 
-/// Refuses a dataset whose times or categories do not fit the records. Times
-/// are i32 milliseconds from the window start; clicks reach 7 days before the
-/// window and attribution adds 7 days to a click time, so the window's span
-/// plus 7 days must fit in i32.
 pub fn check_fits(window: Window, products: &Products) -> Result<(), String> {
     let span = window.end.saturating_sub(window.start);
     let most = i64::from(i32::MAX) - WEEK;
@@ -115,10 +94,8 @@ pub struct Context<'a> {
     pub products: &'a Products,
 }
 
-/// Raw records per scan thread, then per event bucket.
 pub type Parsed = Vec<Vec<Vec<Raw>>>;
 
-/// Surviving events per person bucket, split into parts that together hold the bucket.
 pub type Buckets<T> = Vec<Vec<Vec<T>>>;
 
 fn parse_price(b: &[u8]) -> Option<u32> {
@@ -177,7 +154,6 @@ fn parse_event(fields: &[&[u8]; 7], ctx: &Context) -> Option<Raw> {
     })
 }
 
-/// Reads every event file into raw records, bucketed by event_id.
 pub fn parse(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Result<Parsed> {
     let bytes = crate::scan::total_size(paths)? as usize;
     let per_bucket = bytes / 70 / threads / EVENT_BUCKETS + 16;
@@ -194,15 +170,8 @@ pub fn parse(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Resul
     )
 }
 
-/// Dedups on event_id (smallest ingest wins, before validation), keeps the
-/// valid, not-late events and returns them bucketed by person. Each thread
-/// writes a person bucket's events into chunks sized from the raw count: no
-/// output vector is ever reallocated, and chunks are allocated as dedup
-/// advances, while the processed raw records are being freed.
 pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> {
-    /// Chunks each thread fills per person bucket when events spread evenly.
     const CHUNKS_PER_PART: usize = 8;
-    /// Smallest chunk, in events.
     const MIN_CHUNK: usize = 64;
     let by_bucket: Vec<Mutex<Vec<Vec<Raw>>>> = (0..EVENT_BUCKETS).map(|_| Mutex::new(Vec::with_capacity(parsed.len()))).collect();
     let mut raw_total = 0;
@@ -284,8 +253,6 @@ pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> 
     buckets
 }
 
-/// Turns per-thread lists of buckets into per-bucket lists of parts, moving
-/// only the vectors, never their contents.
 pub fn transpose<T>(per_thread: Vec<Vec<Vec<T>>>) -> Buckets<T> {
     let buckets = per_thread.first().map_or(0, Vec::len);
     let mut out: Buckets<T> = (0..buckets).map(|_| Vec::with_capacity(per_thread.len())).collect();
@@ -312,7 +279,6 @@ mod tests {
         Window { start: at("2026-10-01T00:00:00Z"), end: at("2026-10-15T00:00:00Z") }
     }
 
-    /// `p1` is in category 0; the last category is `unknown`.
     fn products(categories: usize) -> Products {
         let mut map = HashMap::new();
         map.insert(Key::from_bytes(b"p1"), 0);
@@ -392,16 +358,11 @@ mod tests {
         let products = products(3);
         let ctx = Context { window: window(), products: &products };
         let copies = [
-            // Ingested decades before the window, one millisecond apart: the
-            // earlier copy, read second, is kept.
             raw(&ctx, ["e1", "u2", "2026-10-03T10:00:00Z", "631152000001", "view", "p1", ""]),
             raw(&ctx, ["e1", "u3", "2026-10-03T10:05:00Z", "631152000000", "view", "p1", ""]),
-            // The earliest copy fails a check, so the event is dropped.
             raw(&ctx, ["e2", "u1", "2026-10-03 10:00:00", "2026-10-03T10:01:00Z", "view", "p1", ""]),
             raw(&ctx, ["e2", "u1", "2026-10-03T10:00:00Z", "2026-10-03T10:05:00Z", "view", "p1", ""]),
-            // A purchase by a linked ID goes under the person's name.
             raw(&ctx, ["e3", "u2", "2026-10-03T11:00:00Z", "2026-10-03T11:00:00Z", "purchase", "p1", "500"]),
-            // Exactly 24 hours late is kept.
             raw(&ctx, ["e4", "u4", "2026-10-03T12:00:00Z", "2026-10-04T12:00:00Z", "cart", "p1", ""]),
         ];
         let mut state: Vec<Vec<Raw>> = (0..EVENT_BUCKETS).map(|_| Vec::new()).collect();
@@ -438,9 +399,6 @@ mod dedup_tests {
         Key::from_bytes(text.as_bytes())
     }
 
-    /// Raw records with copies: later copies naming another user, earlier
-    /// invalid copies that drop their event, later valid copies of invalid
-    /// events, identical copies, and one user with many more events.
     fn raws(count: usize) -> Vec<Raw> {
         let mut out = Vec::new();
         let mut x: u64 = 0x5EED;
@@ -466,7 +424,6 @@ mod dedup_tests {
         out
     }
 
-    /// The records spread over scan parts and event buckets as `parse` leaves them.
     fn parsed(raws: &[Raw], scan_threads: usize) -> Parsed {
         let mut parsed: Parsed = (0..scan_threads).map(|_| (0..EVENT_BUCKETS).map(|_| Vec::new()).collect()).collect();
         for (i, raw) in raws.iter().enumerate() {
@@ -477,7 +434,6 @@ mod dedup_tests {
 
     type Row = (u64, i32, u32, u16, bool);
 
-    /// Per person bucket, the sorted surviving events of a plain dedup.
     fn expected(raws: &[Raw], people: &People) -> Vec<Vec<Row>> {
         let mut kept: HashMap<Key, Raw> = HashMap::new();
         for raw in raws {

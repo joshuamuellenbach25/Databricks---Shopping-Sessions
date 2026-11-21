@@ -6,15 +6,11 @@ use crate::ids::Key;
 use crate::lookups::Products;
 use crate::timestamp;
 
-/// Times here are i32 milliseconds from the window start. `events::check_fits`
-/// refuses a window whose span plus 7 days exceeds i32, so a click time plus
-/// `WEEK`, or a session start minus a click time, stays within i32.
 const GAP: i32 = (30 * timestamp::MINUTE) as i32;
 const WEEK: i32 = timestamp::WEEK as i32;
 
 pub struct UserRow {
     pub person: Key,
-    /// Days since the epoch.
     pub day: i32,
     pub sessions: i64,
     pub events: i64,
@@ -30,7 +26,6 @@ pub struct Cell {
     pub assisted: i64,
 }
 
-/// Per (campaign, day) totals; campaign 0 is `organic`.
 pub struct Accum {
     pub days: usize,
     pub cells: Vec<Cell>,
@@ -56,18 +51,13 @@ impl Accum {
 }
 
 pub struct Rules<'a> {
-    /// The window start in epoch milliseconds, the zero of every stored time.
     pub origin: i64,
-    /// Days since the epoch of the window's first day.
     pub base_day: i32,
-    /// Days the window touches.
     pub days: usize,
     pub products: &'a Products,
 }
 
 impl Rules<'_> {
-    /// Position, counted from the window's first day, of the UTC day holding
-    /// the stored time `ts`.
     #[inline]
     fn day(&self, ts: i32) -> usize {
         (timestamp::day_of(self.origin + i64::from(ts)) - self.base_day) as usize
@@ -88,15 +78,12 @@ struct DayAgg {
     cats: Vec<(u16, i64)>,
 }
 
-/// Scratch space reused across buckets.
 pub struct Scratch {
-    /// Seconds this thread spent grouping events and clicks by person.
     pub sort_seconds: f64,
     person: PersonScratch,
     group: GroupScratch,
 }
 
-/// Scratch space reused across persons.
 struct PersonScratch {
     sessions: Vec<Session>,
     day_agg: Vec<DayAgg>,
@@ -105,16 +92,11 @@ struct PersonScratch {
     by_campaign: Vec<(u16, i32)>,
 }
 
-/// One bucket's events and clicks laid out person by person.
 #[derive(Default)]
 struct GroupScratch {
-    /// Person to its group number, in order of first appearance.
     index: HashMap<Key, u32>,
-    /// Group number of each event and click, in reading order; clicks of a
-    /// person without events get `NO_GROUP`.
     event_tag: Vec<u32>,
     click_tag: Vec<u32>,
-    /// Start of each group in `events` and `clicks`, plus the total.
     event_off: Vec<u32>,
     click_off: Vec<u32>,
     fill: Vec<u32>,
@@ -140,7 +122,6 @@ impl Scratch {
     }
 }
 
-/// Turns per-group counts into start offsets followed by the total.
 fn offsets(counts: &mut Vec<u32>) -> usize {
     let mut total = 0u32;
     for count in counts.iter_mut() {
@@ -152,8 +133,6 @@ fn offsets(counts: &mut Vec<u32>) -> usize {
     total as usize
 }
 
-/// Sessionizes, credits, assists and aggregates one bucket of persons, given
-/// as parts that together hold every event and click of those persons.
 pub fn run_bucket(event_parts: &[Vec<Event>], click_parts: &[Vec<Click>], rules: &Rules, scratch: &mut Scratch, rows: &mut Vec<UserRow>, accum: &mut Accum) {
     let started = std::time::Instant::now();
     let Scratch { sort_seconds, person, group: g } = scratch;
@@ -366,14 +345,10 @@ mod tests {
         let u1 = Key::from_bytes(b"u1");
         let late_evening = (11 * HOUR + 59 * timestamp::MINUTE) as i32;
         let events = vec![
-            // 23:59 on the first day and a purchase at 00:10 the next: one session of the first day.
             Event { person: u1, ts: late_evening, sale: Sale::NONE },
             Event { person: u1, ts: late_evening + 11 * timestamp::MINUTE as i32, sale: Sale::new(700, 0) },
-            // Midnight starting the third day.
             Event { person: u1, ts: (36 * HOUR) as i32, sale: Sale::NONE },
         ];
-        // Exactly 7 days before the first session, so before the window: it
-        // credits and assists that session and is too old for the second.
         let clicks = vec![Click { person: u1, id: Key::from_bytes(b"k1"), ts: late_evening - WEEK, campaign: 1 }];
         assert!(clicks[0].ts < 0);
         let mut scratch = Scratch::new(days);

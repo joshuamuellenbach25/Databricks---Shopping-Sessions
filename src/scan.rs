@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use memchr::memchr;
 use memmap2::MmapOptions;
 
-/// Every `*.csv` file directly in `dir`, sorted by name.
 pub fn csv_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir)? {
@@ -28,10 +27,6 @@ pub fn total_size(paths: &[PathBuf]) -> io::Result<u64> {
     Ok(total)
 }
 
-/// Splits every file into chunks and runs `work(state, data, start, end)` on
-/// each, on `threads` workers with their own state made by `init`. The maps
-/// are never unmapped: the process exits soon after, and unmapping 1.6 GB
-/// costs a quarter second on some systems.
 fn run_tasks<S, I, W>(paths: &[PathBuf], threads: usize, chunk: usize, init: I, work: W) -> io::Result<Vec<S>>
 where
     S: Send,
@@ -81,9 +76,6 @@ where
     Ok(states)
 }
 
-/// Calls `line` once for every data line of every file (the first line of
-/// each file is its header and is skipped; a last line without `\n` counts).
-/// Line order is unspecified.
 #[cfg(test)]
 pub fn run<S, I, F>(paths: &[PathBuf], threads: usize, chunk: usize, init: I, line: F) -> io::Result<Vec<S>>
 where
@@ -94,9 +86,6 @@ where
     run_tasks(paths, threads, chunk, init, |state, data, start, end| lines(data, start, end, state, &line))
 }
 
-/// Calls `f` once for every well-formed data line of every file, with its `N`
-/// fields unquoted, exactly as `dialect::split` would give them. Malformed
-/// lines are skipped. Line order is unspecified.
 pub fn run_fields<const N: usize, S, I, F>(paths: &[PathBuf], threads: usize, chunk: usize, init: I, f: F) -> io::Result<Vec<S>>
 where
     S: Send,
@@ -106,8 +95,6 @@ where
     run_tasks(paths, threads, chunk, init, |state, data, start, end| fields::<N, S>(data, start, end, state, &f))
 }
 
-/// The start of the first line a chunk owns: after the header for the first
-/// chunk, else the first line starting at or after `start`.
 fn first_line(data: &[u8], start: usize) -> Option<usize> {
     if start == 0 {
         memchr(b'\n', data).map(|i| i + 1)
@@ -133,8 +120,6 @@ fn lines<S>(data: &[u8], start: usize, end: usize, state: &mut S, line: &impl Fn
     }
 }
 
-/// Bit i of each mask is set when byte i of a 64-byte block is a comma, a
-/// quote or a newline.
 #[derive(Clone, Copy)]
 struct Masks {
     comma: u64,
@@ -142,7 +127,6 @@ struct Masks {
     newline: u64,
 }
 
-/// The masks of the 64 bytes from `p`, which must all be readable.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
 unsafe fn masks(p: *const u8) -> Masks {
@@ -160,7 +144,6 @@ unsafe fn masks(p: *const u8) -> Masks {
     }
 }
 
-/// The masks of the 64 bytes from `p`, which must all be readable.
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
 #[inline(always)]
 unsafe fn masks(p: *const u8) -> Masks {
@@ -178,7 +161,6 @@ unsafe fn masks(p: *const u8) -> Masks {
     m
 }
 
-/// The masks of the 64 bytes from `p`, which must all be readable.
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
 unsafe fn masks(p: *const u8) -> Masks {
@@ -192,8 +174,6 @@ unsafe fn masks(p: *const u8) -> Masks {
     m
 }
 
-/// The masks of one line, bit i standing for byte i of the line: `u64` for a
-/// line shorter than 64 bytes, `u128` for one shorter than 128.
 trait Bits: Copy + Eq + BitAnd<Output = Self> + BitOr<Output = Self> + BitXor<Output = Self> + Not<Output = Self> + Shl<u32, Output = Self> + Shr<u32, Output = Self> {
     const ZERO: Self;
     const ONE: Self;
@@ -229,18 +209,6 @@ macro_rules! bits {
 bits!(u64);
 bits!(u128);
 
-/// Splits the `len`-byte line at `data[at..]`, whose `\n` is the byte at
-/// `at + len`, into `out` exactly as `dialect::split` does, from the comma
-/// and quote masks of the bytes from `at` (bits past the line are ignored).
-/// Returns false for a malformed line.
-///
-/// A quote is legal only as the first or the last byte of a field of two or
-/// more bytes, and a field opens with a quote exactly when it closes with
-/// one. So every quote has a separator on exactly one side (a comma, or the
-/// newline before or after the line). And adding the bit of each opening
-/// quote to the mask of non-separators carries through the rest of its
-/// field into the separator that ends it: those separators must be exactly
-/// the ones that follow a quote.
 #[inline(always)]
 fn split_masked<'a, M: Bits, const N: usize>(data: &'a [u8], at: usize, len: u32, comma: M, quote: M, out: &mut [&'a [u8]; N]) -> bool {
     debug_assert!(data[at + len as usize] == b'\n');
@@ -257,16 +225,12 @@ fn split_masked<'a, M: Bits, const N: usize>(data: &'a [u8], at: usize, len: u32
     if commas.count_ones() != N as u32 - 1 || (stray | (opened ^ closed)) != M::ZERO {
         return false;
     }
-    // SAFETY: every byte from `at` to the line's `\n` is in `data`, and
-    // each field runs from `start` to `stop`, with start <= stop <= len.
     let base = unsafe { data.as_ptr().add(at) };
     let mut rest = commas;
     let mut start = 0;
     for (i, field) in out.iter_mut().enumerate() {
         let stop = if i + 1 < N { rest.trailing_zeros() as usize } else { len as usize };
         rest = rest & rest.wrapping_add(!M::ZERO);
-        // A field that opens with a quote is two or more bytes long and
-        // closes with one; its value is the bytes between them.
         let quoted = usize::from(unsafe { *base.add(start) } == b'"');
         debug_assert!(start + 2 * quoted <= stop && stop <= len as usize);
         *field = unsafe { std::slice::from_raw_parts(base.add(start + quoted), stop - start - 2 * quoted) };
@@ -275,15 +239,9 @@ fn split_masked<'a, M: Bits, const N: usize>(data: &'a [u8], at: usize, len: u32
     true
 }
 
-/// Splits the line that starts at `at` into `out`, returning its length
-/// without the `\n` and whether it is well-formed. A line shorter than 128
-/// bytes that has 128 bytes of data from its start is split from its masks;
-/// longer lines and the lines near the end of the data (the last one perhaps
-/// without a `\n`) go to `dialect::split`.
 #[inline(always)]
 fn split_line<'a, const N: usize>(data: &'a [u8], at: usize, out: &mut [&'a [u8]; N]) -> (usize, bool) {
     if at + 128 <= data.len() {
-        // SAFETY: the 128 bytes from `at` are in `data`.
         let lo = unsafe { masks(data.as_ptr().add(at)) };
         if lo.newline != 0 {
             let len = lo.newline.trailing_zeros();
@@ -355,10 +313,8 @@ mod tests {
         }
     }
 
-    /// The field values of well-formed lines, one list per line.
     type Rows = Vec<Vec<Vec<u8>>>;
 
-    /// A linear congruential generator, for repeatable test data.
     struct Rng(u64);
 
     impl Rng {
@@ -372,7 +328,6 @@ mod tests {
         }
     }
 
-    /// What `dialect::split` gives for every data line of `text`, in order.
     fn expected<const N: usize>(text: &[u8]) -> Rows {
         let Some(header) = memchr(b'\n', text) else {
             return Vec::new();
@@ -392,7 +347,6 @@ mod tests {
         rows
     }
 
-    /// What `fields` gives for `text` read in chunks of `chunk` bytes, in order.
     fn tokenized<const N: usize>(text: &[u8], chunk: usize) -> Rows {
         let mut rows = Vec::new();
         let mut start = 0;
@@ -408,8 +362,6 @@ mod tests {
         row.map(|r| r.iter().map(|v| String::from_utf8_lossy(v).into_owned()).collect())
     }
 
-    /// Checks `fields` against `dialect::split` on `text`, with chunk ends at
-    /// every byte, around 64 and 128 bytes, and nowhere.
     fn agree<const N: usize>(text: &[u8], label: &str) {
         let want = expected::<N>(text);
         for chunk in [1, 2, 7, 63, 64, 65, 127, 128, 129, usize::MAX] {
@@ -427,9 +379,6 @@ mod tests {
     const QUOTED_EMPTY: u8 = 3;
     const SHAPES: [[u8; 4]; 4] = [[PLAIN; 4], [QUOTED; 4], [QUOTED, PLAIN, EMPTY, QUOTED_EMPTY], [QUOTED_EMPTY, QUOTED, PLAIN, EMPTY]];
 
-    /// A well-formed line of `n` fields and exactly `len` bytes, field i
-    /// shaped by `shape[i % 4]`, its spare bytes spread over the plain and
-    /// quoted fields. None when no such line exists.
     fn shaped(n: usize, len: usize, shape: [u8; 4]) -> Option<Vec<u8>> {
         let shapes: Vec<u8> = (0..n).map(|i| shape[i % 4]).collect();
         let quoted = |s: u8| s == QUOTED || s == QUOTED_EMPTY;
@@ -493,10 +442,6 @@ mod tests {
         every_length::<7>();
     }
 
-    /// Lines made from well-formed ones by putting a quote between two bytes
-    /// and in place of a byte, at every position, by taking out each quote,
-    /// and, for short lines, by putting in two quotes at every pair of
-    /// positions.
     fn quotes_everywhere<const N: usize>() {
         for len in [0, 1, 2, 3, 5, 9, 12, 30, 61, 62, 63, 64, 65, 66, 100, 125, 126, 127, 128, 129, 130] {
             for shape in SHAPES {
@@ -578,10 +523,6 @@ mod tests {
         }
     }
 
-    /// A random line: noise from a small alphabet, up to 300 bytes long; a
-    /// well-formed line of `n` fields with empty, quoted, short and long
-    /// values; such a line with a quote or a comma put in, a byte made a
-    /// quote or a byte taken out; or a line of `n` short values, some quoted.
     fn random_line(rng: &mut Rng, n: usize) -> Vec<u8> {
         let kind = rng.below(4);
         if kind == 0 {

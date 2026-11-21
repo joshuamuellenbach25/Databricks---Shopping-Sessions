@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""
-A plain reading of rules.md, written for clarity rather than speed, used to
-cross-check the solver on generated data.
-
-Usage: python reference.py DATA_DIR OUT_DIR
-Writes OUT_DIR/user_daily.csv and OUT_DIR/campaign_daily.csv in the format
-of the fixtures' expected tables (day as YYYY-MM-DD, empty top_category for
-null). Bytes are read and written as latin-1 so comparisons stay byte-wise.
-"""
 import glob
 import json
 import os

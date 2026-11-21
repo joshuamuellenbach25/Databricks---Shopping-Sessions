@@ -15,15 +15,12 @@ pub struct Window {
 pub struct Products {
     pub map: HashMap<Key, u16>,
     pub categories: Vec<Vec<u8>>,
-    /// The category of a product not in the file.
     pub unknown: u16,
-    /// Position of each category in byte-wise order, for ties.
     pub rank: Vec<u16>,
 }
 
 pub struct Campaigns {
     pub map: HashMap<Key, u16>,
-    /// Index 0 is `organic`; the rest follow campaigns.csv.
     pub ids: Vec<Vec<u8>>,
     pub channels: Vec<Vec<u8>>,
 }

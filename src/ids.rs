@@ -3,10 +3,6 @@ use std::sync::{Mutex, OnceLock};
 
 use hashbrown::HashMap;
 
-/// An ID as one 64-bit word. An ID of at most 10 bytes drawn from `0-9`,
-/// `A-Z`, `_` and `a-z` packs 6 bits per byte, codes in ASCII order and 0 as
-/// padding, so the derived ordering equals byte-wise ordering. Any other ID
-/// is interned and carries the top bit; it compares through its bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Key(pub u64);
 
@@ -55,7 +51,6 @@ fn long_ids() -> &'static Mutex<LongIds> {
     LONG_IDS.get_or_init(|| Mutex::new(LongIds::default()))
 }
 
-/// Bits 0 to 4, and bit 5, of each of the `PACKED_MAX` 6-bit code fields.
 const FIELD_LOW: u64 = every_field(0x1F);
 const FIELD_HIGH: u64 = every_field(0x20);
 
@@ -74,8 +69,6 @@ fn code(c: u8) -> u64 {
     u64::from(CODE[c as usize])
 }
 
-/// The bytes of an ID shorter than 8 bytes in one word, the first byte
-/// lowest, zeros past the end.
 #[inline(always)]
 fn short_word(b: &[u8]) -> u64 {
     let n = b.len();
@@ -90,8 +83,6 @@ fn short_word(b: &[u8]) -> u64 {
     }
 }
 
-/// The packed key of an ID of at most `PACKED_MAX` bytes from the packable
-/// alphabet; None for any other ID.
 #[inline(always)]
 fn pack(b: &[u8]) -> Option<Key> {
     let n = b.len();
@@ -103,7 +94,6 @@ fn pack(b: &[u8]) -> Option<Key> {
         for (i, &c) in b[..8].iter().enumerate() {
             value |= code(c) << (6 * (PACKED_MAX - 1 - i));
         }
-        // Bytes 8 and 9, zero past the end.
         let tail = u32::from(u16::from_le_bytes([b[n - 2], b[n - 1]])) >> (8 * (PACKED_MAX - n));
         value | (code(tail as u8) << 6) | code((tail >> 8) as u8)
     } else {
@@ -114,8 +104,6 @@ fn pack(b: &[u8]) -> Option<Key> {
         }
         value
     };
-    // A byte outside the alphabet has code 0, as does every position past
-    // the end: the ID packs when exactly its n leading fields are nonzero.
     let nonzero = (((value & FIELD_LOW) + FIELD_LOW) | value) & FIELD_HIGH;
     let leading = FIELD_HIGH & !((1u64 << (6 * (PACKED_MAX - n))) - 1);
     (nonzero == leading).then_some(Key(value))
@@ -166,7 +154,6 @@ impl Key {
         }
     }
 
-    /// Spreads the key over `1 << bits` buckets.
     #[inline]
     pub fn bucket(self, bits: u32) -> usize {
         (self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize
@@ -209,7 +196,6 @@ mod tests {
         }
     }
 
-    /// The byte-at-a-time packing that `pack` must agree with on every ID.
     fn reference_pack(b: &[u8]) -> Option<u64> {
         if b.len() > PACKED_MAX {
             return None;
@@ -247,8 +233,6 @@ mod tests {
                 }
             }
         }
-        // The 11 untouched IDs of at most 10 bytes, the empty one included,
-        // plus 63 of the 256 bytes at each of the 55 positions of those IDs.
         assert_eq!(packed, 1 + PACKED_MAX + 63 * 55);
     }
 
