@@ -178,23 +178,38 @@ struct PersonScratch {
 #[derive(Default)]
 struct GroupScratch {
     persons: Persons,
-    event_tag: Vec<u32>,
+    pairs: Vec<u64>,
+    bought: Vec<(u32, u64)>,
     event_off: Vec<u32>,
     purchase_off: Vec<u32>,
     click_off: Vec<u32>,
     fill: Vec<u32>,
-    purchase_fill: Vec<u32>,
     times: Vec<u32>,
     purchases: Vec<u64>,
-    click_tag: Vec<u32>,
-    clicks: Vec<Click>,
+    found: Vec<(u32, Filed)>,
+    keys: Vec<u64>,
+    spare: Vec<u64>,
+    digits: Vec<u32>,
+    clicks: Vec<Filed>,
 }
 
-const NO_GROUP: u32 = u32::MAX;
+#[derive(Clone, Copy)]
+struct Filed {
+    id: Key,
+    ts: i32,
+    campaign: u16,
+}
+
+impl Default for Filed {
+    fn default() -> Filed {
+        Filed { id: Key(0), ts: 0, campaign: 0 }
+    }
+}
 
 impl Scratch {
     pub fn new(campaigns: usize, days: usize) -> Scratch {
         let slots = days * (timestamp::DAY as usize).div_ceil(GAP as usize);
+        assert!(slots.div_ceil(64) <= 64, "{days} days need {slots} half-hour slots; the slot summary holds 64 words of 64");
         Scratch {
             sort_seconds: 0.0,
             person: PersonScratch {
@@ -215,13 +230,19 @@ impl Scratch {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct Entry {
+    key: u64,
+    tag: u32,
+    events: u32,
+}
+
 #[derive(Default)]
 struct Persons {
-    keys: Vec<u64>,
-    numbers: Vec<u32>,
+    table: Vec<Entry>,
     shift: u32,
     list: Vec<Key>,
-    positions: Vec<usize>,
+    positions: Vec<u32>,
 }
 
 const PERSON_MIX: u64 = 0xFF51_AFD7_ED55_8CCD;
@@ -229,19 +250,18 @@ const MIN_POSITIONS: usize = 64;
 
 impl Persons {
     fn clear(&mut self) {
-        if self.numbers.is_empty() {
+        if self.table.is_empty() {
             self.resize(MIN_POSITIONS);
         }
         for &position in &self.positions {
-            self.numbers[position] = 0;
+            self.table[position as usize].events = 0;
         }
         self.list.clear();
         self.positions.clear();
     }
 
     fn resize(&mut self, positions: usize) {
-        self.keys = vec![0; positions];
-        self.numbers = vec![0; positions];
+        self.table = vec![Entry::default(); positions];
         self.shift = 64 - positions.trailing_zeros();
     }
 
@@ -251,59 +271,65 @@ impl Persons {
     }
 
     #[inline(always)]
-    fn number(&mut self, key: Key) -> usize {
-        let mask = self.numbers.len() - 1;
+    fn count(&mut self, key: Key) -> u32 {
+        let mask = self.table.len() - 1;
         let mut i = self.home(key);
         loop {
-            let n = self.numbers[i];
-            if n == 0 {
+            let entry = &mut self.table[i];
+            if entry.events == 0 {
                 return self.insert(i, key);
             }
-            if self.keys[i] == key.0 {
-                return n as usize - 1;
+            if entry.key == key.0 {
+                entry.events += 1;
+                return entry.tag;
             }
             i = (i + 1) & mask;
         }
     }
 
     #[inline(always)]
-    fn find(&self, key: Key) -> Option<usize> {
-        let mask = self.numbers.len() - 1;
+    fn find(&self, key: Key) -> Option<u32> {
+        let mask = self.table.len() - 1;
         let mut i = self.home(key);
         loop {
-            let n = self.numbers[i];
-            if n == 0 {
+            let entry = &self.table[i];
+            if entry.events == 0 {
                 return None;
             }
-            if self.keys[i] == key.0 {
-                return Some(n as usize - 1);
+            if entry.key == key.0 {
+                return Some(entry.tag);
             }
             i = (i + 1) & mask;
         }
     }
 
-    fn insert(&mut self, mut position: usize, key: Key) -> usize {
-        if 2 * (self.list.len() + 1) > self.numbers.len() {
-            self.resize(2 * self.numbers.len());
-            for n in 0..self.list.len() {
-                let at = self.free_position(self.list[n]);
-                self.keys[at] = self.list[n].0;
-                self.numbers[at] = n as u32 + 1;
-                self.positions[n] = at;
+    fn events(&self, tag: usize) -> u32 {
+        self.table[self.positions[tag] as usize].events
+    }
+
+    fn insert(&mut self, mut position: usize, key: Key) -> u32 {
+        if 2 * (self.list.len() + 1) > self.table.len() {
+            let old = std::mem::take(&mut self.table);
+            self.resize(2 * old.len());
+            for n in 0..self.positions.len() {
+                let entry = old[self.positions[n] as usize];
+                let at = self.free_position(Key(entry.key));
+                self.table[at] = entry;
+                self.positions[n] = at as u32;
             }
             position = self.free_position(key);
         }
-        self.keys[position] = key.0;
+        let tag = self.list.len() as u32;
+        self.table[position] = Entry { key: key.0, tag, events: 1 };
         self.list.push(key);
-        self.positions.push(position);
-        self.numbers[position] = self.list.len() as u32;
-        self.list.len() - 1
+        self.positions.push(position as u32);
+        tag
     }
 
     fn free_position(&self, key: Key) -> usize {
-        let mask = self.numbers.len() - 1;
+        let mask = self.table.len() - 1;
         let mut i = self.home(key);
-        while self.numbers[i] != 0 {
+        while self.table[i].events != 0 {
             i = (i + 1) & mask;
         }
         i
@@ -340,119 +366,129 @@ pub fn run_bucket(event_parts: &[Vec<Event>], click_parts: &[Vec<Click>], rules:
     let started = std::time::Instant::now();
     let Scratch { sort_seconds, person, group: g } = scratch;
     g.persons.clear();
-    g.event_tag.clear();
-    g.event_off.clear();
-    g.purchase_off.clear();
+    g.pairs.clear();
+    g.bought.clear();
     for part in event_parts {
         for event in part {
-            let tag = g.persons.number(event.person);
-            if tag == g.event_off.len() {
-                g.event_off.push(0);
-                g.purchase_off.push(0);
+            debug_assert!(event.ts >= 0);
+            let tag = g.persons.count(event.person);
+            g.pairs.push((u64::from(tag) << 32) | u64::from(event.ts as u32));
+            if event.sale.is_purchase() {
+                g.bought.push((tag, pack(event)));
             }
-            g.event_off[tag] += 1;
-            g.purchase_off[tag] += u32::from(event.sale.is_purchase());
-            g.event_tag.push(tag as u32);
         }
     }
-    let groups = g.event_off.len();
+    let groups = g.persons.list.len();
     if groups == 0 {
         return Ok(());
     }
-    let total = offsets(&mut g.event_off);
-    let bought = offsets(&mut g.purchase_off);
-    if g.times.len() < total {
-        g.times.resize(total, 0);
+    g.event_off.clear();
+    let mut total = 0u32;
+    for tag in 0..groups {
+        g.event_off.push(total);
+        total += g.persons.events(tag);
     }
+    g.event_off.push(total);
+    if g.times.len() < total as usize {
+        g.times.resize(total as usize, 0);
+    }
+    g.fill.clear();
+    g.fill.extend_from_slice(&g.event_off[..groups]);
+    for &pair in &g.pairs {
+        let at = &mut g.fill[(pair >> 32) as usize];
+        g.times[*at as usize] = pair as u32;
+        *at += 1;
+    }
+    g.purchase_off.clear();
+    g.purchase_off.resize(groups, 0);
+    for &(tag, _) in &g.bought {
+        g.purchase_off[tag as usize] += 1;
+    }
+    let bought = offsets(&mut g.purchase_off);
     if g.purchases.len() < bought {
         g.purchases.resize(bought, 0);
     }
     g.fill.clear();
-    g.fill.extend_from_slice(&g.event_off[..groups]);
-    g.purchase_fill.clear();
-    g.purchase_fill.extend_from_slice(&g.purchase_off[..groups]);
-    let mut tags = g.event_tag.as_slice();
-    for part in event_parts {
-        let (part_tags, rest) = tags.split_at(part.len());
-        tags = rest;
-        for (event, &tag) in part.iter().zip(part_tags) {
-            debug_assert!(event.ts >= 0);
-            let at = &mut g.fill[tag as usize];
-            g.times[*at as usize] = event.ts as u32;
-            *at += 1;
-            if event.sale.is_purchase() {
-                let at = &mut g.purchase_fill[tag as usize];
-                g.purchases[*at as usize] = pack(event);
-                *at += 1;
-            }
-        }
+    g.fill.extend_from_slice(&g.purchase_off[..groups]);
+    for &(tag, word) in &g.bought {
+        let at = &mut g.fill[tag as usize];
+        g.purchases[*at as usize] = word;
+        *at += 1;
     }
 
-    g.click_tag.clear();
+    g.found.clear();
+    g.keys.clear();
     g.click_off.clear();
     g.click_off.resize(groups, 0);
-    let mut first_click = None;
     for part in click_parts {
         for click in part {
-            let tag = match g.persons.find(click.person) {
-                Some(tag) => {
-                    g.click_off[tag] += 1;
-                    first_click.get_or_insert(*click);
-                    tag as u32
-                }
-                None => NO_GROUP,
-            };
-            g.click_tag.push(tag);
+            if let Some(tag) = g.persons.find(click.person) {
+                g.click_off[tag as usize] += 1;
+                g.keys.push((u64::from((click.ts + WEEK) as u32) << 32) | g.found.len() as u64);
+                g.found.push((tag, Filed { id: click.id, ts: click.ts, campaign: click.campaign }));
+            }
         }
     }
     let kept = offsets(&mut g.click_off);
-    if let Some(first_click) = first_click {
-        if g.clicks.len() < kept {
-            g.clicks.resize(kept, first_click);
-        }
-        g.fill.clear();
-        g.fill.extend_from_slice(&g.click_off[..groups]);
-        let mut tags = g.click_tag.as_slice();
-        for part in click_parts {
-            let (part_tags, rest) = tags.split_at(part.len());
-            tags = rest;
-            for (click, &tag) in part.iter().zip(part_tags) {
-                if tag == NO_GROUP {
-                    continue;
-                }
-                let (first, end) = (g.click_off[tag as usize] as usize, g.click_off[tag as usize + 1] as usize);
-                let fill = &mut g.fill[tag as usize];
-                let mut at = *fill as usize;
-                *fill += 1;
-                if end - first <= INSERTED_CLICKS {
-                    while at > first && click_order(&g.clicks[at - 1], click).is_gt() {
-                        g.clicks[at] = g.clicks[at - 1];
-                        at -= 1;
-                    }
-                }
-                g.clicks[at] = *click;
-            }
-        }
+    by_time(&mut g.keys, &mut g.spare, &mut g.digits);
+    if g.clicks.len() < kept {
+        g.clicks.resize(kept, Filed::default());
+    }
+    g.fill.clear();
+    g.fill.extend_from_slice(&g.click_off[..groups]);
+    for &key in &g.keys {
+        let (tag, filed) = g.found[key as u32 as usize];
+        let at = &mut g.fill[tag as usize];
+        g.clicks[*at as usize] = filed;
+        *at += 1;
     }
     *sort_seconds += started.elapsed().as_secs_f64();
 
     for t in 0..groups {
         let times = &g.times[g.event_off[t] as usize..g.event_off[t + 1] as usize];
         let purchases = &g.purchases[g.purchase_off[t] as usize..g.purchase_off[t + 1] as usize];
-        let clicks = &mut g.clicks[g.click_off[t] as usize..g.click_off[t + 1] as usize];
-        if clicks.len() > INSERTED_CLICKS {
-            clicks.sort_unstable_by(click_order);
-        }
+        let clicks = &g.clicks[g.click_off[t] as usize..g.click_off[t + 1] as usize];
         person_rows(g.persons.list[t], times, purchases, clicks, rules, person, rows, counts)?;
     }
     Ok(())
 }
 
-const INSERTED_CLICKS: usize = 32;
+const DIGIT_BITS: u32 = 11;
+const DIGITS: usize = 1 << DIGIT_BITS;
 
-#[inline(always)]
-fn click_order(a: &Click, b: &Click) -> std::cmp::Ordering {
-    a.ts.cmp(&b.ts).then_with(|| a.id.cmp_bytes(b.id))
+fn by_time(keys: &mut Vec<u64>, spare: &mut Vec<u64>, digits: &mut Vec<u32>) {
+    if keys.len() < 2 {
+        return;
+    }
+    digits.clear();
+    digits.resize(3 * DIGITS, 0);
+    for &key in keys.iter() {
+        let time = (key >> 32) as usize;
+        for pass in 0..3 {
+            digits[pass * DIGITS + ((time >> (pass as u32 * DIGIT_BITS)) & (DIGITS - 1))] += 1;
+        }
+    }
+    spare.clear();
+    spare.resize(keys.len(), 0);
+    for pass in 0..3 {
+        let counts = &mut digits[pass * DIGITS..(pass + 1) * DIGITS];
+        if counts.iter().any(|&count| count as usize == keys.len()) {
+            continue;
+        }
+        let mut total = 0;
+        for count in counts.iter_mut() {
+            let n = *count;
+            *count = total;
+            total += n;
+        }
+        let shift = 32 + pass as u32 * DIGIT_BITS;
+        for &key in keys.iter() {
+            let at = &mut counts[((key >> shift) as usize) & (DIGITS - 1)];
+            spare[*at as usize] = key;
+            *at += 1;
+        }
+        std::mem::swap(keys, spare);
+    }
 }
 
 const SHORT_RUN: usize = 16;
@@ -468,7 +504,8 @@ fn range_bits(lo: usize, hi: usize) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], rules: &Rules, scratch: &mut PersonScratch, rows: &mut UserRows, counts: &mut Counts) -> Result<(), String> {
+fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Filed], rules: &Rules, scratch: &mut PersonScratch, rows: &mut UserRows, counts: &mut Counts) -> Result<(), String> {
+    let mut words = 0u64;
     for &t in times {
         let s = slot_of(t);
         let slot = &mut scratch.slots[s];
@@ -476,10 +513,13 @@ fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], 
         slot.last = slot.last.max(t);
         slot.events += 1;
         scratch.occupied[s / 64] |= 1 << (s % 64);
+        words |= 1 << (s / 64);
     }
     scratch.sessions.clear();
     let mut previous: Option<(usize, u32)> = None;
-    for w in 0..scratch.occupied.len() {
+    while words != 0 {
+        let w = words.trailing_zeros() as usize;
+        words &= words - 1;
         let mut bits = std::mem::take(&mut scratch.occupied[w]);
         while bits != 0 {
             let s = w * 64 + bits.trailing_zeros() as usize;
@@ -507,131 +547,10 @@ fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], 
         }
     }
 
-    let mut seen = 0;
-    let mut run = 0;
-    for session in &scratch.sessions {
-        let (start, day) = (session.start, session.day);
-        let agg = &mut scratch.day_agg[day];
-        if agg.sessions == 0 {
-            scratch.used_days.push(day);
-        }
-        agg.sessions += 1;
-        agg.events += i64::from(session.events);
-        agg.revenue += session.revenue;
-        while seen < clicks.len() && clicks[seen].ts <= start {
-            if seen == 0 || clicks[seen].ts != clicks[seen - 1].ts {
-                run = seen;
-            }
-            seen += 1;
-        }
-        let campaign = if seen > 0 && start - clicks[seen - 1].ts <= WEEK { clicks[run].campaign } else { 0 };
-        let cell = counts.cell(campaign, day);
-        counts.sessions[cell] += 1;
-        if session.revenue > 0 {
-            counts.purchasing[cell] += 1;
-            counts.revenue[cell] += session.revenue;
-        }
-    }
-
-    let sessions = &scratch.sessions;
-    if !clicks.is_empty() && sessions.len() <= 64 {
-        let (mut lo, mut hi) = (0, 0);
-        for click in clicks {
-            let ts = click.ts;
-            while lo < sessions.len() && sessions[lo].start < ts {
-                lo += 1;
-            }
-            while hi < sessions.len() && sessions[hi].start - ts <= WEEK {
-                hi += 1;
-            }
-            if lo < hi {
-                let bits = &mut scratch.assist_bits[usize::from(click.campaign)];
-                if *bits == 0 {
-                    scratch.touched.push(click.campaign);
-                }
-                *bits |= range_bits(lo, hi);
-            }
-        }
-        scratch.day_bits.clear();
-        scratch.day_rank.clear();
-        for (i, session) in sessions.iter().enumerate() {
-            if i == 0 || session.day != sessions[i - 1].day {
-                scratch.day_bits.push(0);
-            }
-            *scratch.day_bits.last_mut().unwrap() |= 1 << i;
-            scratch.day_rank.push(scratch.day_bits.len() as u8 - 1);
-        }
-        for &campaign in &scratch.touched {
-            let mut bits = std::mem::take(&mut scratch.assist_bits[usize::from(campaign)]);
-            while bits != 0 {
-                let rank = usize::from(scratch.day_rank[bits.trailing_zeros() as usize]);
-                let on_day = bits & scratch.day_bits[rank];
-                let cell = counts.cell(campaign, scratch.used_days[rank]);
-                counts.assisted[cell] += on_day.count_ones();
-                bits &= !on_day;
-            }
-        }
-        scratch.touched.clear();
-    } else if !clicks.is_empty() {
-        let (mut lo, mut hi) = (0, 0);
-        let mut day_lo_filled = false;
-        for click in clicks {
-            let ts = click.ts;
-            while lo < sessions.len() && sessions[lo].start < ts {
-                lo += 1;
-            }
-            while hi < sessions.len() && sessions[hi].start - ts <= WEEK {
-                hi += 1;
-            }
-            let campaign = click.campaign;
-            let covered = &mut scratch.covered[usize::from(campaign)];
-            let from = lo.max(*covered as usize);
-            if from >= hi {
-                continue;
-            }
-            if *covered == 0 {
-                scratch.touched.push(campaign);
-            }
-            *covered = hi as u32;
-            if hi - from <= SHORT_RUN {
-                let mut d = sessions[from].day;
-                let mut n = 0;
-                for s in &sessions[from..hi] {
-                    if s.day != d {
-                        let cell = counts.cell(campaign, d);
-                        counts.assisted[cell] += n;
-                        d = s.day;
-                        n = 0;
-                    }
-                    n += 1;
-                }
-                let cell = counts.cell(campaign, d);
-                counts.assisted[cell] += n;
-            } else {
-                if !day_lo_filled {
-                    let (first_day, last_day) = (sessions[0].day, sessions[sessions.len() - 1].day);
-                    let mut i = 0;
-                    for d in first_day..=last_day + 1 {
-                        while i < sessions.len() && sessions[i].day < d {
-                            i += 1;
-                        }
-                        scratch.day_lo[d] = i;
-                    }
-                    day_lo_filled = true;
-                }
-                for d in sessions[from].day..=sessions[hi - 1].day {
-                    let n = hi.min(scratch.day_lo[d + 1]).saturating_sub(from.max(scratch.day_lo[d]));
-                    if n > 0 {
-                        let cell = counts.cell(campaign, d);
-                        counts.assisted[cell] += n as u32;
-                    }
-                }
-            }
-        }
-        for &campaign in &scratch.touched {
-            scratch.covered[usize::from(campaign)] = 0;
-        }
-        scratch.touched.clear();
+    if scratch.sessions.len() <= 64 {
+        few_sessions(clicks, scratch, counts);
+    } else {
+        many_sessions(clicks, scratch, counts);
     }
 
     for &day in &scratch.used_days {
@@ -668,6 +587,167 @@ fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], 
     rows.persons.push((person, scratch.used_days.len() as u32));
     scratch.used_days.clear();
     Ok(())
+}
+
+#[inline(always)]
+fn credit(counts: &mut Counts, campaign: u16, session: &Session) {
+    let cell = counts.cell(campaign, session.day);
+    counts.sessions[cell] += 1;
+    if session.revenue > 0 {
+        counts.purchasing[cell] += 1;
+        counts.revenue[cell] += session.revenue;
+    }
+}
+
+#[inline(always)]
+fn add_day(day_agg: &mut [DayAgg], used_days: &mut Vec<usize>, session: &Session) -> bool {
+    let agg = &mut day_agg[session.day];
+    let first = agg.sessions == 0;
+    if first {
+        used_days.push(session.day);
+    }
+    agg.sessions += 1;
+    agg.events += i64::from(session.events);
+    agg.revenue += session.revenue;
+    first
+}
+
+#[inline(always)]
+fn latest(clicks: &[Filed], run: usize, seen: usize, start: i32) -> u16 {
+    if seen > 0 && start - clicks[seen - 1].ts <= WEEK {
+        let mut best = &clicks[run];
+        for click in &clicks[run + 1..seen] {
+            if click.id.cmp_bytes(best.id).is_lt() {
+                best = click;
+            }
+        }
+        best.campaign
+    } else {
+        0
+    }
+}
+
+fn few_sessions(clicks: &[Filed], scratch: &mut PersonScratch, counts: &mut Counts) {
+    let sessions = &scratch.sessions;
+    let (mut seen, mut run, mut hi) = (0, 0, 0);
+    scratch.day_bits.clear();
+    scratch.day_rank.clear();
+    for (j, session) in sessions.iter().enumerate() {
+        if add_day(&mut scratch.day_agg, &mut scratch.used_days, session) {
+            scratch.day_bits.push(0);
+        }
+        let rank = scratch.day_bits.len() - 1;
+        scratch.day_bits[rank] |= 1 << j;
+        scratch.day_rank.push(rank as u8);
+        let start = session.start;
+        while seen < clicks.len() && clicks[seen].ts <= start {
+            let click = &clicks[seen];
+            if seen == 0 || click.ts != clicks[seen - 1].ts {
+                run = seen;
+            }
+            while hi < sessions.len() && sessions[hi].start - click.ts <= WEEK {
+                hi += 1;
+            }
+            if j < hi {
+                let bits = &mut scratch.assist_bits[usize::from(click.campaign)];
+                if *bits == 0 {
+                    scratch.touched.push(click.campaign);
+                }
+                *bits |= range_bits(j, hi);
+            }
+            seen += 1;
+        }
+        credit(counts, latest(clicks, run, seen, start), session);
+    }
+    if scratch.touched.is_empty() {
+        return;
+    }
+    for &campaign in &scratch.touched {
+        let mut bits = std::mem::take(&mut scratch.assist_bits[usize::from(campaign)]);
+        while bits != 0 {
+            let rank = usize::from(scratch.day_rank[bits.trailing_zeros() as usize]);
+            let on_day = bits & scratch.day_bits[rank];
+            let cell = counts.cell(campaign, scratch.used_days[rank]);
+            counts.assisted[cell] += on_day.count_ones();
+            bits &= !on_day;
+        }
+    }
+    scratch.touched.clear();
+}
+
+fn many_sessions(clicks: &[Filed], scratch: &mut PersonScratch, counts: &mut Counts) {
+    let sessions = &scratch.sessions;
+    let (mut seen, mut run) = (0, 0);
+    for session in sessions {
+        add_day(&mut scratch.day_agg, &mut scratch.used_days, session);
+        let start = session.start;
+        while seen < clicks.len() && clicks[seen].ts <= start {
+            if seen == 0 || clicks[seen].ts != clicks[seen - 1].ts {
+                run = seen;
+            }
+            seen += 1;
+        }
+        credit(counts, latest(clicks, run, seen, start), session);
+    }
+    let (mut lo, mut hi) = (0, 0);
+    let mut day_lo_filled = false;
+    for click in clicks {
+        let ts = click.ts;
+        while lo < sessions.len() && sessions[lo].start < ts {
+            lo += 1;
+        }
+        while hi < sessions.len() && sessions[hi].start - ts <= WEEK {
+            hi += 1;
+        }
+        let campaign = click.campaign;
+        let covered = &mut scratch.covered[usize::from(campaign)];
+        let from = lo.max(*covered as usize);
+        if from >= hi {
+            continue;
+        }
+        if *covered == 0 {
+            scratch.touched.push(campaign);
+        }
+        *covered = hi as u32;
+        if hi - from <= SHORT_RUN {
+            let mut d = sessions[from].day;
+            let mut n = 0;
+            for s in &sessions[from..hi] {
+                if s.day != d {
+                    let cell = counts.cell(campaign, d);
+                    counts.assisted[cell] += n;
+                    d = s.day;
+                    n = 0;
+                }
+                n += 1;
+            }
+            let cell = counts.cell(campaign, d);
+            counts.assisted[cell] += n;
+        } else {
+            if !day_lo_filled {
+                let (first_day, last_day) = (sessions[0].day, sessions[sessions.len() - 1].day);
+                let mut i = 0;
+                for d in first_day..=last_day + 1 {
+                    while i < sessions.len() && sessions[i].day < d {
+                        i += 1;
+                    }
+                    scratch.day_lo[d] = i;
+                }
+                day_lo_filled = true;
+            }
+            for d in sessions[from].day..=sessions[hi - 1].day {
+                let n = hi.min(scratch.day_lo[d + 1]).saturating_sub(from.max(scratch.day_lo[d]));
+                if n > 0 {
+                    let cell = counts.cell(campaign, d);
+                    counts.assisted[cell] += n as u32;
+                }
+            }
+        }
+    }
+    for &campaign in &scratch.touched {
+        scratch.covered[usize::from(campaign)] = 0;
+    }
+    scratch.touched.clear();
 }
 
 #[cfg(test)]
@@ -779,7 +859,7 @@ mod tests {
         for person in [few, many] {
             clicks.extend([click(person, "kz", start - 10, 1), click(person, "k1", start - 10, 4), click(person, "k-2", start - 10, 3), click(person, "k0", start - 20, 2)]);
         }
-        clicks.extend((0..2 * INSERTED_CLICKS as i32).map(|i| click(many, &format!("m{i}"), start - 1000 - i, 2)));
+        clicks.extend((0..64).map(|i| click(many, &format!("m{i}"), start - 1000 - i, 2)));
         clicks.reverse();
         let mut scratch = Scratch::new(5, days);
         let mut rows = UserRows::default();
@@ -793,23 +873,51 @@ mod tests {
     }
 
     #[test]
+    fn clicks_sort_by_time_and_keep_their_order_on_ties() {
+        let mut x: u64 = 7;
+        let mut next = move || {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x >> 33
+        };
+        for n in [0u64, 1, 2, 3, 100, 5000] {
+            let mut keys: Vec<u64> = (0..n)
+                .map(|i| {
+                    let time = match next() % 4 {
+                        0 => next() % 8,
+                        1 => (next() % 4) << 22,
+                        _ => next() % (1 << 31),
+                    };
+                    (time << 32) | i
+                })
+                .collect();
+            let mut want = keys.clone();
+            want.sort_by_key(|&key| key >> 32);
+            let (mut spare, mut digits) = (Vec::new(), Vec::new());
+            by_time(&mut keys, &mut spare, &mut digits);
+            assert_eq!(keys, want, "{n} keys");
+        }
+    }
+
+    #[test]
     fn persons_number_in_order_of_first_appearance_through_growth() {
         let mut persons = Persons::default();
         for round in 0..3 {
             persons.clear();
             let keys: Vec<Key> = (0..1000 + 300 * round).map(|i| Key::from_bytes(format!("p{}", i * 7 + round).as_bytes())).collect();
             for (n, &key) in keys.iter().enumerate() {
-                assert_eq!(persons.number(key), n);
-                assert_eq!(persons.number(key), n);
+                assert_eq!(persons.count(key), n as u32);
+                assert_eq!(persons.count(key), n as u32);
             }
             for (n, &key) in keys.iter().enumerate() {
-                assert_eq!(persons.find(key), Some(n));
+                assert_eq!(persons.find(key), Some(n as u32));
                 assert_eq!(persons.list[n], key);
+                assert_eq!(persons.events(n), 2);
             }
             assert_eq!(persons.find(Key::from_bytes(b"absent")), None);
             assert_eq!(persons.find(Key(0)), None);
-            assert_eq!(persons.number(Key(0)), keys.len());
-            assert_eq!(persons.find(Key(0)), Some(keys.len()));
+            assert_eq!(persons.count(Key(0)), keys.len() as u32);
+            assert_eq!(persons.find(Key(0)), Some(keys.len() as u32));
+            assert_eq!(persons.events(keys.len()), 1);
         }
     }
 
@@ -867,7 +975,7 @@ mod tests {
         events.retain(|e| e.ts < end);
         clicks.retain(|c| c.ts >= -WEEK && c.ts < end);
         assert!(events.iter().filter(|e| e.person == Key::from_bytes(b"u0")).count() >= 512);
-        assert!(clicks.iter().filter(|c| c.person == Key::from_bytes(b"u0")).count() > INSERTED_CLICKS);
+        assert!(clicks.iter().filter(|c| c.person == Key::from_bytes(b"u0")).count() > 32);
         for i in (1..events.len()).rev() {
             events.swap(i, next(i as u64 + 1) as usize);
         }
