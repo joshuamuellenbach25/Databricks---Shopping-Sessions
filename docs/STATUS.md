@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 07:55 UTC.
+Updated 2026-11-21 08:01 UTC.
 
 | Item | Value |
 |---|---|
@@ -19,7 +19,7 @@ Updated 2026-11-21 07:55 UTC.
 | opt/main-fix1 | quoted CPU pinning in the volume runner, no comment lines in Cargo.lock | d05a8d9; gates pass with locked cargo (43 tests, 36/36, dev MATCH, 6/6); every cargo command locked; Codex re-review clean; merged into main |
 | opt/memexit | release memory and input mappings early to cut page zeroing and exit teardown (about 0.4 s of each local run falls after the last timed phase) | 5cd5648; gates pass (45 tests, 36/36, dev MATCH, 6/6); time after the last phase 339 ms to 91 ms; pinned bench median 901 ms against 1104.5 ms for the 1.04 s build, faster in 11 of 12 low-load rounds; Codex review running |
 | opt/directio | Linux input reads that skip the page cache when the data is not resident, overlapped with parsing | ee748b6 on the old main; gates pass on Windows (44 tests, 36/36, dev MATCH, 6/6), where only the fallback path runs; Codex re-check left 2 test-only items; the Linux code has not been compiled yet (no Linux target or Docker here) |
-| opt/sessions2 | sessions and output rewrite (25 percent of runtime) | a90c101 on opt/cand1; sessions and output 0.174 s to 0.097 s, lower in 16 of 16 rounds; gates pass; Codex confirmed 3 items (stale parts when an output folder is reused with fewer threads, empty parts left by a failed run, added comments), fixes running |
+| opt/sessions2 | sessions and output rewrite (25 percent of runtime) | a90c101 on opt/cand1; sessions and output 0.174 s to 0.097 s, lower in 16 of 16 rounds; gates pass; Codex confirmed 3 items (stale parts when an output folder is reused with fewer threads, empty parts left by a failed run, added comments); fix 9e9c9f3 stages output parts and publishes them after a whole run; Codex re-check running |
 | opt/cand3 | main plus only the opt/sessions2 change, comments stripped | 0890fe7; tests 48 passed, 36/36 fixtures, 6/6 seeds; Codex review and pinned bench running |
 | opt/nocomments | remove code comments from the shipped files with a parser | superseded: the parse2 merge removed every comment from main (parser check: 0 left) |
 | opt/parse-fix | inline timestamp parsing, word-at-a-time prices, review fix | gates pass; slower than the best scored code in a pinned 9-round bench (median 1123 ms against 1078 ms); not submitted |
