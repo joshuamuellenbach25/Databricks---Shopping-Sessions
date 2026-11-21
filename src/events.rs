@@ -185,7 +185,11 @@ pub fn parse(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Resul
         paths,
         threads,
         CHUNK,
-        || (0..EVENT_BUCKETS).map(|_| Vec::<Raw>::with_capacity(per_bucket)).collect::<Vec<_>>(),
+        || {
+            let mut state = (0..EVENT_BUCKETS).map(|_| Vec::<Raw>::with_capacity(per_bucket)).collect::<Vec<_>>();
+            crate::prefault::vectors(&mut state);
+            state
+        },
         |state, fields| {
             if let Some(raw) = parse_event(fields, ctx) {
                 state[raw.event.bucket(EVENT_BITS)].push(raw);

@@ -6,6 +6,7 @@ mod links;
 mod lookups;
 mod output;
 mod people;
+mod prefault;
 mod scan;
 mod sessions;
 mod timestamp;
@@ -108,6 +109,7 @@ fn run() -> Result<(), Fail> {
     let click_ctx = clicks::Context { window, campaigns: &campaigns, people: &people };
     let click_buckets = clicks::collect(&click_files, threads, &click_ctx)?;
     eprintln!("valid clicks: {}", count(&click_buckets));
+    eprintln!("{}", prefault::report());
     phase("clicks");
 
     let base_day = timestamp::day_of(window.start);

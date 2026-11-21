@@ -55,7 +55,9 @@ struct Filed {
 
 impl Filed {
     fn new(per_bucket: usize) -> Filed {
-        Filed { buckets: (0..PERSON_BUCKETS).map(|_| Vec::with_capacity(per_bucket)).collect(), ring: [EMPTY; PREFETCH_AHEAD], parsed: 0 }
+        let mut buckets: Vec<Vec<Click>> = (0..PERSON_BUCKETS).map(|_| Vec::with_capacity(per_bucket)).collect();
+        crate::prefault::vectors(&mut buckets);
+        Filed { buckets, ring: [EMPTY; PREFETCH_AHEAD], parsed: 0 }
     }
 
     #[inline(always)]
