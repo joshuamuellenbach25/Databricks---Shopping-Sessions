@@ -7,9 +7,13 @@ pub struct People {
     mask: usize,
     shift: u32,
     linked: usize,
+    filter: Vec<u64>,
+    filter_mask: usize,
 }
 
 const SLOT_MIX: u64 = 0xD6E8_FEB8_6659_FD93;
+const FILTER_MIX: u64 = 0x9E6C_63D0_676A_9A99;
+const FILTER_BITS_PER_ID: usize = 8;
 
 impl People {
     pub fn build(pairs: impl IntoIterator<Item = (Key, Key)>, expected: usize) -> People {
@@ -48,13 +52,18 @@ impl People {
             }
         }
         let capacity = (names.len() * 2).next_power_of_two().max(16);
+        let words = (names.len() * FILTER_BITS_PER_ID / 64).next_power_of_two();
         let mut people = People {
             slots: vec![[0, 0]; capacity],
             mask: capacity - 1,
             shift: 64 - capacity.trailing_zeros(),
             linked: names.len(),
+            filter: vec![0; words],
+            filter_mask: words - 1,
         };
         for (id, name) in names {
+            let (word, bits) = people.filter_bits(id);
+            people.filter[word] |= bits;
             let mut i = people.slot(id);
             while people.slots[i][0] != 0 {
                 i = (i + 1) & people.mask;
@@ -70,7 +79,20 @@ impl People {
     }
 
     #[inline(always)]
-    pub fn prefetch(&self, key: Key) {
+    fn filter_bits(&self, key: Key) -> (usize, u64) {
+        let product = u128::from(key.0) * u128::from(FILTER_MIX);
+        let hash = (product >> 64) as u64 ^ product as u64;
+        (hash as usize & self.filter_mask, (1 << (hash >> 58)) | (1 << ((hash >> 52) & 63)))
+    }
+
+    #[inline(always)]
+    pub fn may_be_linked(&self, key: Key) -> bool {
+        let (word, bits) = self.filter_bits(key);
+        self.filter[word] & bits == bits
+    }
+
+    #[inline(always)]
+    pub fn prefetch_slot(&self, key: Key) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
@@ -80,8 +102,17 @@ impl People {
         let _ = key;
     }
 
-    #[inline(always)]
+    #[cfg(test)]
     pub fn name_of(&self, key: Key) -> Key {
+        if self.may_be_linked(key) {
+            self.linked_name(key)
+        } else {
+            key
+        }
+    }
+
+    #[inline(always)]
+    pub fn linked_name(&self, key: Key) -> Key {
         let mut i = self.slot(key);
         loop {
             let [id, name] = self.slots[i];
