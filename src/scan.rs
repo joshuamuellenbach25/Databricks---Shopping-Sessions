@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use memchr::memchr;
+use memmap2::MmapOptions;
 
 /// Every `*.csv` file directly in `dir`, sorted by name.
 pub fn csv_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
@@ -26,60 +27,10 @@ pub fn total_size(paths: &[PathBuf]) -> io::Result<u64> {
     Ok(total)
 }
 
-/// Reads `buf.len()` bytes at `offset`, failing if the file ends first.
-fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
-    while !buf.is_empty() {
-        #[cfg(unix)]
-        let n = std::os::unix::fs::FileExt::read_at(file, buf, offset)?;
-        #[cfg(windows)]
-        let n = std::os::windows::fs::FileExt::seek_read(file, buf, offset)?;
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "file is shorter than its listed size"));
-        }
-        buf = &mut buf[n..];
-        offset += n as u64;
-    }
-    Ok(())
-}
-
-/// Bytes read past a chunk's end on the first try, enough for any normal line.
-const LOOKAHEAD: usize = 4096;
-
-/// Reads the bytes a chunk needs into `buf`: from one byte before `start`
-/// (so the chunk can tell whether a line starts there) through the newline
-/// that ends the last line starting before `end`, or through the end of the
-/// file. Returns the length read and `start` and `end` relative to `buf`.
-fn read_chunk(file: &File, size: u64, start: u64, end: u64, buf: &mut Vec<u8>) -> io::Result<(usize, usize, usize)> {
-    let lo = start.saturating_sub(1);
-    let mut have = ((end + LOOKAHEAD as u64).min(size) - lo) as usize;
-    if buf.len() < have {
-        buf.resize(have, 0);
-    }
-    read_exact_at(file, &mut buf[..have], lo)?;
-    let mut search = (end - 1 - lo) as usize;
-    loop {
-        if let Some(i) = memchr(b'\n', &buf[search..have]) {
-            have = search + i + 1;
-            break;
-        }
-        if lo + have as u64 == size {
-            break;
-        }
-        let more = (LOOKAHEAD * 16).min((size - lo) as usize - have);
-        if buf.len() < have + more {
-            buf.resize(have + more, 0);
-        }
-        read_exact_at(file, &mut buf[have..have + more], lo + have as u64)?;
-        search = have;
-        have += more;
-    }
-    Ok((have, (start - lo) as usize, (end - lo) as usize))
-}
-
 /// Splits every file into chunks and runs `work(state, data, start, end)` on
-/// each, on `threads` workers with their own state made by `init`. Each worker
-/// reads its chunks with positional reads into one reused buffer, so the
-/// bytes it scans are still in cache and no page of the input is mapped.
+/// each, on `threads` workers with their own state made by `init`. The maps
+/// are never unmapped: the process exits soon after, and unmapping 1.6 GB
+/// costs a quarter second on some systems.
 fn run_tasks<S, I, W>(paths: &[PathBuf], threads: usize, chunk: usize, init: I, work: W) -> io::Result<Vec<S>>
 where
     S: Send,
@@ -87,49 +38,45 @@ where
     W: Fn(&mut S, &[u8], usize, usize) + Sync,
 {
     let clock = std::time::Instant::now();
-    let mut sizes = Vec::with_capacity(paths.len());
+    let mut maps = Vec::with_capacity(paths.len());
     for path in paths {
-        sizes.push(std::fs::metadata(path)?.len());
+        let file = File::open(path)?;
+        if file.metadata()?.len() == 0 {
+            continue;
+        }
+        let map = unsafe { MmapOptions::new().map(&file)? };
+        maps.push(map);
     }
     let mut tasks = Vec::new();
-    for (index, &size) in sizes.iter().enumerate() {
-        let mut start = 0u64;
-        while start < size {
-            tasks.push((index, start, (start + chunk as u64).min(size)));
-            start += chunk as u64;
+    for (index, map) in maps.iter().enumerate() {
+        let mut start = 0;
+        while start < map.len() {
+            tasks.push((index, start, (start + chunk).min(map.len())));
+            start += chunk;
         }
     }
-    let listed = clock.elapsed();
+    let mapped = clock.elapsed();
     let next = AtomicUsize::new(0);
-    let results = std::thread::scope(|scope| {
+    let states = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
-                scope.spawn(|| -> io::Result<S> {
+                scope.spawn(|| {
                     let mut state = init();
-                    let mut files: Vec<Option<File>> = (0..paths.len()).map(|_| None).collect();
-                    let mut buf: Vec<u8> = vec![0; chunk + LOOKAHEAD];
                     loop {
                         let t = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(index, start, end)) = tasks.get(t) else {
+                        let Some(&(file, start, end)) = tasks.get(t) else {
                             break;
                         };
-                        if files[index].is_none() {
-                            let file = File::open(&paths[index]).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", paths[index].display())))?;
-                            files[index] = Some(file);
-                        }
-                        let file = files[index].as_ref().expect("opened above");
-                        let (len, s, e) = read_chunk(file, sizes[index], start, end, &mut buf)
-                            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", paths[index].display())))?;
-                        work(&mut state, &buf[..len], s, e);
+                        work(&mut state, &maps[file], start, end);
                     }
-                    Ok(state)
+                    state
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<io::Result<S>>>()
+        handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<S>>()
     });
-    let states = results.into_iter().collect::<io::Result<Vec<S>>>()?;
-    eprintln!("  scan: {} files, list {:.3} s, parse {:.3} s", paths.len(), listed.as_secs_f64(), (clock.elapsed() - listed).as_secs_f64());
+    std::mem::forget(maps);
+    eprintln!("  scan: {} files, map {:.3} s, parse {:.3} s", paths.len(), mapped.as_secs_f64(), (clock.elapsed() - mapped).as_secs_f64());
     Ok(states)
 }
 
