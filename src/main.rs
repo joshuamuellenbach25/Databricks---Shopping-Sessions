@@ -93,7 +93,7 @@ fn run() -> Result<(), Fail> {
 
     let event_ctx = events::Context::new(window, products);
     let (people, parsed) = std::thread::scope(|scope| {
-        let builder = scope.spawn(|| {
+        let builder = scope.spawn(move || {
             let started = Instant::now();
             let expected: usize = link_pairs.iter().map(Vec::len).sum();
             let people = People::build_in_parts(&link_pairs, 1);
