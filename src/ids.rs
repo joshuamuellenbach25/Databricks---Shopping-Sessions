@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{OnceLock, RwLock, RwLockReadGuard};
 
 use hashbrown::HashMap;
 
@@ -46,9 +46,37 @@ struct LongIds {
     bytes: Vec<Vec<u8>>,
 }
 
-fn long_ids() -> &'static Mutex<LongIds> {
-    static LONG_IDS: OnceLock<Mutex<LongIds>> = OnceLock::new();
-    LONG_IDS.get_or_init(|| Mutex::new(LongIds::default()))
+fn long_ids() -> &'static RwLock<LongIds> {
+    static LONG_IDS: OnceLock<RwLock<LongIds>> = OnceLock::new();
+    LONG_IDS.get_or_init(|| RwLock::new(LongIds::default()))
+}
+
+pub struct Spelling(RwLockReadGuard<'static, LongIds>);
+
+pub fn spelling() -> Spelling {
+    Spelling(long_ids().read().unwrap())
+}
+
+impl Spelling {
+    #[inline]
+    pub fn append(&self, key: Key, out: &mut Vec<u8>) {
+        if key.0 & LONG == 0 {
+            append_packed(key.0, out);
+        } else {
+            out.extend_from_slice(&self.0.bytes[(key.0 & !LONG) as usize]);
+        }
+    }
+}
+
+#[inline]
+fn append_packed(value: u64, out: &mut Vec<u8>) {
+    for i in (0..PACKED_MAX).rev() {
+        let code = ((value >> (6 * i)) & 63) as usize;
+        if code == 0 {
+            break;
+        }
+        out.push(BYTE[code]);
+    }
 }
 
 const FIELD_LOW: u64 = every_field(0x1F);
@@ -120,7 +148,7 @@ impl Key {
 
     #[cold]
     fn intern(b: &[u8]) -> Key {
-        let mut ids = long_ids().lock().unwrap();
+        let mut ids = long_ids().write().unwrap();
         let next = ids.bytes.len() as u64;
         let index = *ids.index.entry(b.to_vec()).or_insert(next);
         if index == next {
@@ -141,7 +169,7 @@ impl Key {
             }
             out
         } else {
-            let ids = long_ids().lock().unwrap();
+            let ids = long_ids().read().unwrap();
             ids.bytes[(self.0 & !LONG) as usize].clone()
         }
     }
@@ -172,6 +200,10 @@ mod tests {
         ];
         for a in &samples {
             assert_eq!(Key::from_bytes(a).to_vec(), a.to_vec(), "{a:?}");
+            let key = Key::from_bytes(a);
+            let mut spelled = b"x".to_vec();
+            spelling().append(key, &mut spelled);
+            assert_eq!(spelled[1..], a[..], "{a:?}");
             for b in &samples {
                 assert_eq!(Key::from_bytes(a).cmp_bytes(Key::from_bytes(b)), a.cmp(b), "{a:?} vs {b:?}");
                 assert_eq!(Key::from_bytes(a) == Key::from_bytes(b), a == b, "{a:?} vs {b:?}");
