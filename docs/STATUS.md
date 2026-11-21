@@ -1,12 +1,12 @@
 # Status
 
-Updated 2026-11-21 08:16 UTC.
+Updated 2026-11-21 08:13 UTC.
 
 | Item | Value |
 |---|---|
 | Best practice score | 1.04 s (commit 79a758b, parse stage redesign) |
-| Board leader | 0.48 s |
-| Target (leader minus 10 percent) | 0.432 s |
+| Board leader | 0.42 s |
+| Target (leader minus 10 percent) | 0.378 s |
 | Main | solver code of 79a758b (parse stage redesign, no code comments) |
 
 ## Work in progress
