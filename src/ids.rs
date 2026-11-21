@@ -1,12 +1,12 @@
 use std::cmp::Ordering;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{OnceLock, RwLock, RwLockReadGuard};
 
 use hashbrown::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Key(pub u64);
 
-pub const PACKED_MAX: usize = 10;
+const PACKED_MAX: usize = 10;
 const LONG: u64 = 1 << 63;
 
 const fn code_table() -> [u8; 256] {
@@ -46,9 +46,37 @@ struct LongIds {
     bytes: Vec<Vec<u8>>,
 }
 
-fn long_ids() -> &'static Mutex<LongIds> {
-    static LONG_IDS: OnceLock<Mutex<LongIds>> = OnceLock::new();
-    LONG_IDS.get_or_init(|| Mutex::new(LongIds::default()))
+fn long_ids() -> &'static RwLock<LongIds> {
+    static LONG_IDS: OnceLock<RwLock<LongIds>> = OnceLock::new();
+    LONG_IDS.get_or_init(|| RwLock::new(LongIds::default()))
+}
+
+pub struct Spelling(RwLockReadGuard<'static, LongIds>);
+
+pub fn spelling() -> Spelling {
+    Spelling(long_ids().read().unwrap())
+}
+
+impl Spelling {
+    #[inline]
+    pub fn append(&self, key: Key, out: &mut Vec<u8>) {
+        if key.0 & LONG == 0 {
+            append_packed(key.0, out);
+        } else {
+            out.extend_from_slice(&self.0.bytes[(key.0 & !LONG) as usize]);
+        }
+    }
+}
+
+#[inline]
+fn append_packed(value: u64, out: &mut Vec<u8>) {
+    for i in (0..PACKED_MAX).rev() {
+        let code = ((value >> (6 * i)) & 63) as usize;
+        if code == 0 {
+            break;
+        }
+        out.push(BYTE[code]);
+    }
 }
 
 const FIELD_LOW: u64 = every_field(0x1F);
@@ -120,7 +148,7 @@ impl Key {
 
     #[cold]
     fn intern(b: &[u8]) -> Key {
-        let mut ids = long_ids().lock().unwrap();
+        let mut ids = long_ids().write().unwrap();
         let next = ids.bytes.len() as u64;
         let index = *ids.index.entry(b.to_vec()).or_insert(next);
         if index == next {
@@ -132,16 +160,6 @@ impl Key {
     pub fn to_vec(self) -> Vec<u8> {
         if self.0 & LONG == 0 {
             let mut out = Vec::with_capacity(PACKED_MAX);
-            self.append_to(&mut out);
-            out
-        } else {
-            let ids = long_ids().lock().unwrap();
-            ids.bytes[(self.0 & !LONG) as usize].clone()
-        }
-    }
-
-    pub fn append_to(self, out: &mut Vec<u8>) {
-        if self.0 & LONG == 0 {
             for i in (0..PACKED_MAX).rev() {
                 let code = ((self.0 >> (6 * i)) & 63) as usize;
                 if code == 0 {
@@ -149,9 +167,10 @@ impl Key {
                 }
                 out.push(BYTE[code]);
             }
+            out
         } else {
-            let ids = long_ids().lock().unwrap();
-            out.extend_from_slice(&ids.bytes[(self.0 & !LONG) as usize]);
+            let ids = long_ids().read().unwrap();
+            ids.bytes[(self.0 & !LONG) as usize].clone()
         }
     }
 
@@ -181,22 +200,14 @@ mod tests {
         ];
         for a in &samples {
             assert_eq!(Key::from_bytes(a).to_vec(), a.to_vec(), "{a:?}");
+            let key = Key::from_bytes(a);
+            let mut spelled = b"x".to_vec();
+            spelling().append(key, &mut spelled);
+            assert_eq!(spelled[1..], a[..], "{a:?}");
             for b in &samples {
                 assert_eq!(Key::from_bytes(a).cmp_bytes(Key::from_bytes(b)), a.cmp(b), "{a:?} vs {b:?}");
                 assert_eq!(Key::from_bytes(a) == Key::from_bytes(b), a == b, "{a:?} vs {b:?}");
             }
-        }
-    }
-
-    #[test]
-    fn append_to_adds_the_bytes_of_packed_and_long_keys() {
-        let samples: Vec<&[u8]> = vec![b"", b"0", b"u1", b"zzzzzzzzzz", b"zzzzzzzzzzz", b"abcdefghijk", b"user_id_a\tuser_id_b", b"u\x00", b"p-1"];
-        let mut got = b"head".to_vec();
-        let mut want = b"head".to_vec();
-        for s in &samples {
-            Key::from_bytes(s).append_to(&mut got);
-            want.extend_from_slice(s);
-            assert_eq!(got, want, "{s:?}");
         }
     }
 

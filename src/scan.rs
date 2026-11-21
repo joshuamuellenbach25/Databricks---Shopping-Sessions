@@ -3,7 +3,6 @@ use std::io;
 use std::ops::{BitAnd, BitOr, BitXor, Not, Shl, Shr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
 
 use memchr::memchr;
@@ -33,21 +32,6 @@ struct Input {
     path: PathBuf,
     len: usize,
     map: OnceLock<io::Result<Mmap>>,
-}
-
-fn unmap_later(inputs: Vec<Input>) {
-    static UNMAPPER: OnceLock<Option<Sender<Vec<Input>>>> = OnceLock::new();
-    let unmapper = UNMAPPER.get_or_init(|| {
-        let (sender, receiver) = mpsc::channel::<Vec<Input>>();
-        std::thread::Builder::new().name("unmapper".into()).spawn(move || receiver.into_iter().for_each(drop)).ok().map(|_| sender)
-    });
-    let Some(sender) = unmapper else {
-        std::mem::forget(inputs);
-        return;
-    };
-    if let Err(mpsc::SendError(inputs)) = sender.send(inputs) {
-        std::mem::forget(inputs);
-    }
 }
 
 fn run_tasks<S, I, W>(paths: &[PathBuf], threads: usize, chunk: usize, init: I, work: W) -> io::Result<Vec<S>>
@@ -108,7 +92,7 @@ where
     if let Some(error) = failed.into_inner().unwrap() {
         return Err(error);
     }
-    unmap_later(inputs);
+    std::mem::forget(inputs);
     eprintln!("  scan: {} files, map {:.3} s, parse {:.3} s", paths.len(), mapped.as_secs_f64(), (clock.elapsed() - mapped).as_secs_f64());
     Ok(states)
 }
@@ -347,35 +331,6 @@ mod tests {
             let mut got: Vec<String> = states.into_iter().flatten().collect();
             got.sort();
             assert_eq!(got, expected, "chunk {chunk}");
-        }
-    }
-
-    #[cfg(windows)]
-    fn still_mapped(file: &Path) -> bool {
-        std::fs::OpenOptions::new().write(true).truncate(true).open(file).is_err()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn still_mapped(file: &Path) -> bool {
-        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
-        let name = file.canonicalize().unwrap();
-        maps.lines().any(|line| line.ends_with(name.to_str().unwrap()))
-    }
-
-    #[cfg(any(windows, target_os = "linux"))]
-    #[test]
-    fn inputs_are_unmapped_after_the_scan() {
-        let dir = temp_dir("unmap");
-        let file = dir.join("a.csv");
-        std::fs::write(&file, b"h1,h2\nx,y\nz,w\n").unwrap();
-        let states = run_fields::<2, _, _, _>(std::slice::from_ref(&file), 2, 4, Vec::new, |s: &mut Vec<Vec<u8>>, f| s.push(f[1].to_vec())).unwrap();
-        let mut got: Vec<Vec<u8>> = states.into_iter().flatten().collect();
-        got.sort();
-        assert_eq!(got, vec![b"w".to_vec(), b"y".to_vec()]);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while still_mapped(&file) {
-            assert!(std::time::Instant::now() < deadline, "{} is still mapped 20 s after its scan", file.display());
-            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
