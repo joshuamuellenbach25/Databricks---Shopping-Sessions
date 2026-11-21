@@ -10,6 +10,7 @@ mod scan;
 mod sessions;
 mod timestamp;
 
+use std::ffi::{c_int, c_long};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,7 +27,22 @@ type Fail = Box<dyn std::error::Error + Send + Sync>;
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// `mi_option_purge_delay` in the `mi_option_t` enum of the linked mimalloc (3.3).
+const MI_OPTION_PURGE_DELAY: c_int = 15;
+
+extern "C" {
+    fn mi_option_set(option: c_int, value: c_long);
+}
+
+/// Stops mimalloc from returning freed memory to the kernel during the run:
+/// memory one phase frees stays mapped and is reused by later phases instead
+/// of being faulted in and zeroed again.
+fn keep_freed_memory() {
+    unsafe { mi_option_set(MI_OPTION_PURGE_DELAY, -1) };
+}
+
 fn main() -> ExitCode {
+    keep_freed_memory();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -166,4 +182,21 @@ fn check_output(out: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern "C" {
+        fn mi_option_get(option: c_int) -> c_long;
+    }
+
+    #[test]
+    fn freed_memory_stays_mapped() {
+        // 1000 ms is the linked mimalloc's default purge delay, so the index names that option.
+        assert_eq!(unsafe { mi_option_get(MI_OPTION_PURGE_DELAY) }, 1000);
+        keep_freed_memory();
+        assert_eq!(unsafe { mi_option_get(MI_OPTION_PURGE_DELAY) }, -1);
+    }
 }

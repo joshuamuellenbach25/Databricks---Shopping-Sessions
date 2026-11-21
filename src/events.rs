@@ -131,20 +131,31 @@ pub fn parse(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Resul
 }
 
 /// Dedups on event_id (smallest ingest wins, before validation), keeps the
-/// valid, not-late events and returns them bucketed by person.
+/// valid, not-late events and returns them bucketed by person. Each thread
+/// writes a person bucket's events into chunks sized from the raw count: no
+/// output vector is ever reallocated, and chunks are allocated as dedup
+/// advances, while the processed raw records are being freed.
 pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> {
+    /// Chunks each thread fills per person bucket when events spread evenly.
+    const CHUNKS_PER_PART: usize = 8;
+    /// Smallest chunk, in events.
+    const MIN_CHUNK: usize = 64;
     let by_bucket: Vec<Mutex<Vec<Vec<Raw>>>> = (0..EVENT_BUCKETS).map(|_| Mutex::new(Vec::with_capacity(parsed.len()))).collect();
+    let mut raw_total = 0;
     for state in parsed {
         for (b, part) in state.into_iter().enumerate() {
+            raw_total += part.len();
             by_bucket[b].lock().unwrap().push(part);
         }
     }
+    let chunk = (raw_total / threads.max(1) / PERSON_BUCKETS / CHUNKS_PER_PART).max(MIN_CHUNK);
     let next = AtomicUsize::new(0);
-    let outputs: Vec<Vec<Vec<Event>>> = std::thread::scope(|scope| {
+    let outputs: Vec<Vec<Vec<Vec<Event>>>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| {
-                    let mut out: Vec<Vec<Event>> = (0..PERSON_BUCKETS).map(|_| Vec::new()).collect();
+                    let mut open: Vec<Vec<Event>> = (0..PERSON_BUCKETS).map(|_| Vec::new()).collect();
+                    let mut full: Vec<Vec<Vec<Event>>> = (0..PERSON_BUCKETS).map(|_| Vec::new()).collect();
                     let mut kept: HashMap<Key, (i64, u32, u32)> = HashMap::new();
                     let mut survivors: Vec<(u32, u32)> = Vec::new();
                     loop {
@@ -178,7 +189,15 @@ pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> 
                             }
                             let raw = &parts[s as usize][p as usize];
                             let person = people.name_of(raw.user);
-                            out[person.bucket(PERSON_BITS)].push(Event {
+                            let bucket = person.bucket(PERSON_BITS);
+                            let current = &mut open[bucket];
+                            if current.len() == current.capacity() {
+                                let filled = std::mem::replace(current, Vec::with_capacity(chunk));
+                                if !filled.is_empty() {
+                                    full[bucket].push(filled);
+                                }
+                            }
+                            current.push(Event {
                                 person,
                                 ts: raw.ts,
                                 price: raw.price,
@@ -187,13 +206,24 @@ pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> 
                             });
                         }
                     }
-                    out
+                    for (bucket, current) in open.into_iter().enumerate() {
+                        if !current.is_empty() {
+                            full[bucket].push(current);
+                        }
+                    }
+                    full
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    transpose(outputs)
+    let mut buckets: Buckets<Event> = (0..PERSON_BUCKETS).map(|_| Vec::new()).collect();
+    for state in outputs {
+        for (bucket, parts) in state.into_iter().enumerate() {
+            buckets[bucket].extend(parts);
+        }
+    }
+    buckets
 }
 
 /// Turns per-thread lists of buckets into per-bucket lists of parts, moving
@@ -209,4 +239,107 @@ pub fn transpose<T>(per_thread: Vec<Vec<Vec<T>>>) -> Buckets<T> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+
+    fn key(text: &str) -> Key {
+        Key::from_bytes(text.as_bytes())
+    }
+
+    /// Raw records with copies: later copies naming another user, earlier
+    /// invalid copies that drop their event, later valid copies of invalid
+    /// events, identical copies, and one user with many more events.
+    fn raws(count: usize) -> Vec<Raw> {
+        let mut out = Vec::new();
+        let mut x: u64 = 0x5EED;
+        for i in 0..count {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let ok = x % 50 != 0;
+            let user = if (x >> 20) % 100 == 0 { key("whale") } else { key(&format!("u{}", (x >> 24) % 3000)) };
+            let base = Raw {
+                event: key(&format!("e{i}")),
+                user: if ok { user } else { key("") },
+                ingest: 1_000_000 + i as i64,
+                ts: (x >> 32) as i64 % 1_000_000,
+                price: if ok && x % 7 == 0 { 100 + (x >> 40) as u32 % 50_000 } else { 0 },
+                cat: (x >> 50) as u16 % 20,
+                ok,
+            };
+            out.push(base);
+            match (x >> 8) % 20 {
+                0 => out.push(Raw { ingest: base.ingest + 5, user: key("other"), ts: base.ts + 1, price: 0, ok: true, ..base }),
+                1 => out.push(Raw { ingest: base.ingest - 5, user: key(""), price: 0, ok: false, ..base }),
+                2 => out.push(base),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The records spread over scan parts and event buckets as `parse` leaves them.
+    fn parsed(raws: &[Raw], scan_threads: usize) -> Parsed {
+        let mut parsed: Parsed = (0..scan_threads).map(|_| (0..EVENT_BUCKETS).map(|_| Vec::new()).collect()).collect();
+        for (i, raw) in raws.iter().enumerate() {
+            parsed[i % scan_threads][raw.event.bucket(EVENT_BITS)].push(*raw);
+        }
+        parsed
+    }
+
+    type Row = (u64, i64, u32, u16, bool);
+
+    /// Per person bucket, the sorted surviving events of a plain dedup.
+    fn expected(raws: &[Raw], people: &People) -> Vec<Vec<Row>> {
+        let mut kept: HashMap<Key, Raw> = HashMap::new();
+        for raw in raws {
+            let entry = kept.entry(raw.event).or_insert(*raw);
+            if raw.ingest < entry.ingest {
+                *entry = *raw;
+            }
+        }
+        let mut out: Vec<Vec<Row>> = vec![Vec::new(); PERSON_BUCKETS];
+        for raw in kept.values().filter(|raw| raw.ok) {
+            let person = people.name_of(raw.user);
+            out[person.bucket(PERSON_BITS)].push((person.0, raw.ts, raw.price, raw.cat, raw.price > 0));
+        }
+        for bucket in &mut out {
+            bucket.sort_unstable();
+        }
+        out
+    }
+
+    #[test]
+    fn keeps_the_earliest_copy_of_each_valid_event_in_its_person_bucket() {
+        let pairs: Vec<(Key, Key)> = (0..600)
+            .map(|i| (key(&format!("u{}", 2 * i)), key(&format!("u{}", 2 * i + 1))))
+            .chain([(key("whale"), key("u7"))])
+            .collect();
+        let people = People::build(pairs.iter().copied(), pairs.len());
+        let raws = raws(200_000);
+        let want = expected(&raws, &people);
+        assert!(want.iter().map(Vec::len).sum::<usize>() > 150_000);
+        for threads in [1, 4] {
+            let got = dedup(parsed(&raws, 3), threads, &people);
+            assert_eq!(got.len(), PERSON_BUCKETS);
+            let mut chunked = false;
+            for (bucket, parts) in got.iter().enumerate() {
+                assert!(parts.iter().all(|part| !part.is_empty()), "empty part in bucket {bucket}, threads {threads}");
+                chunked |= parts.len() > threads;
+                let mut events: Vec<Row> = parts.iter().flatten().map(|e| (e.person.0, e.ts, e.price, e.cat, e.purchase)).collect();
+                events.sort_unstable();
+                assert_eq!(events, want[bucket], "bucket {bucket}, threads {threads}");
+            }
+            assert!(chunked, "threads {threads}: no bucket filled more than one chunk per thread");
+        }
+    }
+
+    #[test]
+    fn no_events_give_every_person_bucket_empty() {
+        let people = People::build(Vec::new(), 0);
+        let got = dedup(Vec::new(), 2, &people);
+        assert_eq!(got.len(), PERSON_BUCKETS);
+        assert!(got.iter().all(Vec::is_empty));
+    }
 }
