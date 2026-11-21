@@ -177,7 +177,7 @@ fn parse_event(fields: &[&[u8]; 7], ctx: &Context) -> Option<Raw> {
     })
 }
 
-const WAITING: usize = 8;
+const WAITING: usize = 16;
 
 struct Filer {
     buckets: Vec<Vec<Raw>>,
