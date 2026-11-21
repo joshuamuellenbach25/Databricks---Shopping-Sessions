@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-Generates small datasets with the published generator and checks that the
-solver and reference.py produce the same tables on each.
-
-Usage: python differential.py GENERATE SOLVER WORK_DIR SEED... [--events N] [--clicks N]
-GENERATE is the generator binary, SOLVER the solver binary, WORK_DIR a scratch
-folder. Exit code 0 when every seed matches.
-"""
 import os
 import subprocess
 import sys

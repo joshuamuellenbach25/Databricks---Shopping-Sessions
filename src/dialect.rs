@@ -1,8 +1,5 @@
 use memchr::memchr;
 
-/// Splits one line (without its `\n`) into exactly `N` fields, removing the
-/// quotes around a whole field. Returns false for a malformed line: a wrong
-/// field count, a quote anywhere but around a whole field, or an empty line.
 pub fn split<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> bool {
     let mut n = 0;
     let mut rest = line;

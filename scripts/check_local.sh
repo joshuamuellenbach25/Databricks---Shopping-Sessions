@@ -1,7 +1,4 @@
 #!/bin/sh
-# Native checks on this machine: build, unit tests, fixtures, dev answer, timed runs.
-# Usage: scripts/check_local.sh DATA_ROOT ANSWER_DIR OUT_ROOT [RUNS]
-# DATA_ROOT holds dev/ and m20/ made by the generator; ANSWER_DIR is dev-answer.zip unzipped.
 set -eu
 DATA_ROOT=$1
 ANSWER=$2
