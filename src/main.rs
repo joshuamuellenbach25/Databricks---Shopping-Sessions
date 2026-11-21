@@ -164,7 +164,9 @@ fn run() -> Result<(), Fail> {
     let sessions_total: i64 = total.cells.iter().map(|c| c.sessions).sum();
     eprintln!("sessions: {sessions_total}");
     check_output(&out)?;
-    Ok(())
+    // Every output file is written and closed, so exit here instead of
+    // returning: returning would free every record buffer one by one first.
+    std::process::exit(0)
 }
 
 fn count<T>(buckets: &[Vec<Vec<T>>]) -> usize {
