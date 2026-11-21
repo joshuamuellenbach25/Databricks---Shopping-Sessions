@@ -1,12 +1,12 @@
 # Status
 
-Updated 2026-11-21 06:22 UTC.
+Updated 2026-11-21 06:32 UTC.
 
 | Item | Value |
 |---|---|
 | Best practice score | 1.14 s (commit 4ea55a8) |
-| Board leader | 0.63 s |
-| Target (leader minus 10 percent) | 0.567 s |
+| Board leader | 0.59 s |
+| Target (leader minus 10 percent) | 0.531 s |
 | Main | solver code of 4ea55a8 (allocator huge pages) |
 
 ## Work in progress
