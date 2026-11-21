@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 11:52 UTC.
+Updated 2026-11-21 12:01 UTC.
 
 | Item | Value |
 |---|---|
@@ -26,7 +26,8 @@ Updated 2026-11-21 11:52 UTC.
 | opt/parse4 | events-only tokenizer and a cheaper first touch of input pages, on the 0.96 s main | 9f8aaa5; gates pass (59 tests, 36/36, dev MATCH, 6/6); tokenizing mapped data 52.8 to 42.0 ms, but the events phase did not drop in fast rounds (295 to 302 ms, lower in 4 of 11) because first touches of the input pages (79 ms) bound it on this Windows host; bench median 1023 ms against 1097 ms, 6 of 15 rounds; Codex review found nothing to fix; parked |
 | opt/scanfields | event scan work after tokenizing (field decoding and record filing) on the 0.92 s main | building |
 | opt/dedup2 | events dedup and clicks (24 percent of runtime), on the 1.04 s solver code | a05b4db; gates pass (46 tests, 36/36, dev MATCH, 6/6); against the 1.04 s build: dedup 118 to 64 ms and clicks 61 to 54 ms (lower in 12 of 16 rounds each), bench median 1133 ms against 1272 ms, 10 of 15 rounds; Codex review found nothing to fix; ported as opt/cand6 |
-| opt/cand8 | the 0.92 s main plus the opt/parse4 tokenizer and the opt/fields2 person build (without its streamed stores) | 5e0f3f9; gates, phase proof, bench, 60M check and a Codex review running |
+| opt/cand8 | the 0.92 s main plus the opt/parse4 tokenizer and the opt/fields2 person build (without its streamed stores) | 5e0f3f9; gates pass (66 tests, 36/36, dev MATCH, 6/6); Codex: no output defect; 60M output identical, person build 1.532 s against 3.351 s; in fast-mode runs 521 to 533 ms in-process against 562 to 579 ms; pinned bench median 1658 ms against 1502 ms, 3 of 15 rounds (slow-mode draws): not submitted |
+| opt/cand9 | opt/cand8 plus the opt/scanfields decoding change | e6371c8; gates, phase proof, bench and 60M check running |
 | opt/fields2 | events parse and people on the 0.92 s main (53 percent of runtime): field decoding and the linked-ID build | 02f9cf2; gates pass (60 tests, 36/36, dev MATCH, 6/6); people 0.159 to 0.070 s, phase 302 to 272 ms in fast rounds (4 of 5); bench median 1516 ms against 1509 ms, 8 of 15 rounds: not a candidate alone; Codex confirmed a missing store fence after streamed batches, to fix before any build ships |
 | opt/cand6 | the 0.96 s main plus the opt/dedup2 change (same patch) | a67654b; gates pass (54 tests, 36/36, dev MATCH, 6/6); Codex review: no output defect, 2 resource limits outside the final's scale (not counted); against the 0.96 s build in the 4 fast-mode rounds of 16: dedup 108 to 55.5 ms, total 662.5 to 604.5 ms; pinned bench median 1174 ms against 1826 ms, faster in 10 of 15 rounds; scored 0.92 s (receipt BB-E8BAC516); merged into main |
 | opt/sessions3 | sessions and output on the 0.96 s solver code (about 21 percent of runtime) | 5e13e45; gates pass (54 tests, 36/36, dev MATCH, 6/6); sessions and output 139 to 97 ms against the 0.96 s build (13 of 16 rounds); about 42 ms of the cut is Windows file work; ported as opt/cand7; lane stopped |
