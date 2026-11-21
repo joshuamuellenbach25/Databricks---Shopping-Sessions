@@ -2,12 +2,14 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use parquet::basic::{Compression, Encoding};
 use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 
+use crate::ids;
 use crate::lookups::Campaigns;
 use crate::sessions::{Accum, UserRow};
 
@@ -50,18 +52,39 @@ fn writer(path: &Path, schema: &str) -> Result<SerializedFileWriter<File>, Fail>
 pub fn write_user_daily(path: &Path, rows: &[UserRow], categories: &[Vec<u8>]) -> Result<(), Fail> {
     let mut file = writer(path, USER_DAILY)?;
     let mut group = file.next_row_group()?;
-    let ids: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.person.to_vec())).collect();
-    column_bytes(&mut group, &ids, None)?;
+    // Every user ID spelled into one buffer under one read of the intern
+    // table; each row's value is a shared slice of it, not its own allocation.
+    let mut text = Vec::with_capacity(rows.len() * 10);
+    let mut ends = Vec::with_capacity(rows.len());
+    let spelling = ids::spelling();
+    for r in rows {
+        spelling.append(r.person, &mut text);
+        ends.push(text.len());
+    }
+    drop(spelling);
+    let text = Bytes::from(text);
+    let mut values: Vec<ByteArray> = Vec::with_capacity(rows.len());
+    let mut start = 0;
+    for &end in &ends {
+        values.push(ByteArray::from(text.slice(start..end)));
+        start = end;
+    }
+    column_bytes(&mut group, &values, None)?;
     let days: Vec<i32> = rows.iter().map(|r| r.day).collect();
     column_i32(&mut group, &days)?;
     let picks: [fn(&UserRow) -> i64; 3] = [|r| r.sessions, |r| r.events, |r| r.revenue];
+    let mut longs: Vec<i64> = Vec::with_capacity(rows.len());
     for pick in picks {
-        let values: Vec<i64> = rows.iter().map(pick).collect();
-        column_i64(&mut group, &values)?;
+        longs.clear();
+        longs.extend(rows.iter().map(pick));
+        column_i64(&mut group, &longs)?;
     }
     let levels: Vec<i16> = rows.iter().map(|r| i16::from(r.top.is_some())).collect();
-    let tops: Vec<ByteArray> = rows.iter().filter_map(|r| r.top).map(|c| ByteArray::from(categories[c as usize].clone())).collect();
-    column_bytes(&mut group, &tops, Some(&levels))?;
+    // Each category's bytes once; rows share them.
+    let names: Vec<Bytes> = categories.iter().map(|c| Bytes::copy_from_slice(c)).collect();
+    values.clear();
+    values.extend(rows.iter().filter_map(|r| r.top).map(|c| ByteArray::from(names[c as usize].clone())));
+    column_bytes(&mut group, &values, Some(&levels))?;
     group.close()?;
     file.close()?;
     Ok(())

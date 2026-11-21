@@ -6,6 +6,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
+bytes = "1"
 hashbrown = "0.17"
 memchr = "2.8"
 memmap2 = "0.9"
