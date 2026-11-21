@@ -58,6 +58,7 @@ fn run() -> Result<(), Fail> {
 
     let window = lookups::read_manifest(&data)?;
     let products = lookups::read_products(&data)?;
+    events::check_fits(window, &products)?;
     let campaigns = lookups::read_campaigns(&data)?;
     let user_dir = out.join("user_daily");
     let campaign_dir = out.join("campaign_daily");
@@ -95,7 +96,7 @@ fn run() -> Result<(), Fail> {
 
     let base_day = timestamp::day_of(window.start);
     let days = (timestamp::day_of(window.end - 1) - base_day + 1) as usize;
-    let rules = Rules { base_day, days, products: &products };
+    let rules = Rules { origin: window.start, base_day, days, products: &products };
     let mut click_buckets = click_buckets.into_iter();
     let buckets: Vec<Mutex<Option<(Vec<Vec<Event>>, Vec<Vec<Click>>)>>> = event_buckets
         .into_iter()
