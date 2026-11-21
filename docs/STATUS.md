@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 04:37 UTC.
+Updated 2026-11-21 04:39 UTC.
 
 | Item | Value |
 |---|---|
@@ -17,5 +17,5 @@ Updated 2026-11-21 04:37 UTC.
 | opt/prefault | pre-fault parse record vectors on Linux | gates pass, dev answer matches on Linux, audit running |
 | opt/parse | faster event parse loop | building |
 | opt/dedupbuf | reuse dedup output buffers | building |
-| opt/writer | write Parquet columns from reused buffers | building |
+| opt/writer | write Parquet columns from reused buffers | first commit 02883c1, gates pending |
 | opt/tsonce | parse each timestamp once | building |
