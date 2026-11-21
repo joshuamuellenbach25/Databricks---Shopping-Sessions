@@ -234,6 +234,8 @@ struct Filer {
 impl Filer {
     fn new(per_bucket: usize) -> Filer {
         const EMPTY: Raw = Raw { event: Key(0), ingest: 0, user: NO_USER, ts: 0, sale: Sale::NONE };
+        #[cfg(target_arch = "x86_64")]
+        EXIT_FENCE.with(|_| ());
         Filer {
             buckets: (0..EVENT_BUCKETS).map(|_| Vec::with_capacity(per_bucket)).collect(),
             waiting: vec![[EMPTY; WAITING]; EVENT_BUCKETS],
@@ -296,7 +298,6 @@ fn stream(bucket: &mut Vec<Raw>, waiting: &[Raw; WAITING]) {
         fence();
         bucket.reserve(WAITING);
     }
-    EXIT_FENCE.with(|_| ());
     unsafe {
         let to = bucket.as_mut_ptr().add(bucket.len()) as *mut __m128i;
         let from = waiting.as_ptr() as *const __m128i;
