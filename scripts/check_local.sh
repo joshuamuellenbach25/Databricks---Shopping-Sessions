@@ -9,7 +9,7 @@ PY=${PYTHON:-python3}
 BIN="$HERE/target/release/solver"
 [ -f "$BIN.exe" ] && BIN="$BIN.exe"
 
-cargo build --release --manifest-path "$HERE/Cargo.toml" > "$OUT_ROOT/build.log" 2>&1 || { tail -30 "$OUT_ROOT/build.log"; exit 1; }
+cargo build --release --locked --manifest-path "$HERE/Cargo.toml" > "$OUT_ROOT/build.log" 2>&1 || { tail -30 "$OUT_ROOT/build.log"; exit 1; }
 echo "build ok"
 "$PY" "$HERE/scripts/run_fixtures.py" "$HERE/fixtures" -- "$BIN" > "$OUT_ROOT/fixtures.log" 2>&1 || true
 tail -1 "$OUT_ROOT/fixtures.log"

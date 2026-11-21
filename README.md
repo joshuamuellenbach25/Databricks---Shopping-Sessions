@@ -30,7 +30,7 @@ A static Rust binary that reads a folder of messy click-stream CSV files (shop e
 
 | Check | Command |
 |---|---|
-| Unit tests, including tokenizer cases at every chunk boundary | `cargo test --release` |
+| Unit tests, including tokenizer cases at every chunk boundary | `cargo test --release --locked` |
 | Every case in `fixtures/` against its expected tables | `python3 scripts/run_fixtures.py fixtures -- target/release/solver` |
 | The published dev set against the published answer | `make run-dev check-dev` |
 | Generated datasets from many seeds against the Python reference in `scripts/reference.py` | `python3 scripts/differential.py GENERATOR SOLVER OUT_DIR SEED...` |
@@ -43,7 +43,7 @@ A static Rust binary that reads a folder of messy click-stream CSV files (shop e
 make build
 make test
 make fixtures
-cargo build --release
+cargo build --release --locked
 DATA_DIR=path/to/data OUTPUT_DIR=path/to/output target/release/solver
 ```
 
