@@ -102,6 +102,17 @@ impl People {
         let _ = key;
     }
 
+    #[inline(always)]
+    pub fn prefetch_filter(&self, key: Key) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch::<_MM_HINT_T0>(self.filter.as_ptr().add(self.filter_bits(key).0) as *const i8);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = key;
+    }
+
     #[cfg(test)]
     pub fn name_of(&self, key: Key) -> Key {
         if self.may_be_linked(key) {
