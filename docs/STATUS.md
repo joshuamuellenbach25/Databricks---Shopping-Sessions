@@ -1,13 +1,13 @@
 # Status
 
-Updated 2026-11-21 08:13 UTC.
+Updated 2026-11-21 08:22 UTC.
 
 | Item | Value |
 |---|---|
-| Best practice score | 1.04 s (commit 79a758b, parse stage redesign) |
+| Best practice score | 1.04 s (commit 5cd5648, entered in the final; 79a758b also scored 1.04 s) |
 | Board leader | 0.42 s |
 | Target (leader minus 10 percent) | 0.378 s |
-| Main | solver code of 79a758b (parse stage redesign, no code comments) |
+| Main | solver code of 5cd5648 (parse stage redesign plus early unmapping and leaner output writing, no code comments) |
 
 ## Work in progress
 
@@ -17,7 +17,7 @@ Updated 2026-11-21 08:13 UTC.
 | opt/people2 | linked-ID build in parts on several threads | b88353f; gates pass; people phase 0.227 s to 0.020 s in a pinned 16-round bench, but that phase runs beside the events parse, so the whole run did not get faster (see opt/cand2); parked |
 | opt/cand2 | main plus the opt/people2 change, comments stripped | 0d40115; gates pass; Codex found no output defect; pinned bench median 1067 ms against 1070 ms for main, faster in 6 of 15 low-load rounds; not submitted |
 | opt/main-fix1 | quoted CPU pinning in the volume runner, no comment lines in Cargo.lock | d05a8d9; gates pass with locked cargo (43 tests, 36/36, dev MATCH, 6/6); every cargo command locked; Codex re-review clean; merged into main |
-| opt/memexit | release memory and input mappings early to cut page zeroing and exit teardown (about 0.4 s of each local run falls after the last timed phase) | 5cd5648; gates pass (45 tests, 36/36, dev MATCH, 6/6); time after the last phase 339 ms to 91 ms; pinned bench median 901 ms against 1104.5 ms for the 1.04 s build, faster in 11 of 12 low-load rounds; Codex review found nothing to fix; submitted (receipt BB-4DFDD35A), being scored |
+| opt/memexit | release memory and input mappings early to cut page zeroing and exit teardown (about 0.4 s of each local run falls after the last timed phase) | 5cd5648; gates pass (45 tests, 36/36, dev MATCH, 6/6); time after the last phase 339 ms to 91 ms; pinned bench median 901 ms against 1104.5 ms for the 1.04 s build, faster in 11 of 12 low-load rounds; Codex review found nothing to fix; scored 1.04 s (receipt BB-4DFDD35A): the local gain was Windows exit time and did not reach the Linux scorer; merged into main |
 | opt/directio | Linux input reads that skip the page cache when the data is not resident, overlapped with parsing | ee748b6 on the old main; gates pass on Windows (44 tests, 36/36, dev MATCH, 6/6), where only the fallback path runs; Codex re-check left 2 test-only items; the Linux code has not been compiled yet (no Linux target or Docker here) |
 | opt/sessions2 | sessions and output rewrite (25 percent of runtime) | a90c101 on opt/cand1; sessions and output 0.174 s to 0.097 s, lower in 16 of 16 rounds; gates pass; Codex confirmed 3 items (stale parts when an output folder is reused with fewer threads, empty parts left by a failed run, added comments); fix 9e9c9f3 stages output parts and publishes them after a whole run; Codex re-check running |
 | opt/cand4 | main plus the opt/directio change, comments stripped | e407c88; gates and Codex review running; Linux code not compiled here |
