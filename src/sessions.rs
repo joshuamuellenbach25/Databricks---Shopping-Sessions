@@ -420,17 +420,9 @@ pub fn run_bucket(event_parts: &[Vec<Event>], click_parts: &[Vec<Click>], rules:
                 if tag == NO_GROUP {
                     continue;
                 }
-                let (first, end) = (g.click_off[tag as usize] as usize, g.click_off[tag as usize + 1] as usize);
                 let fill = &mut g.fill[tag as usize];
-                let mut at = *fill as usize;
+                g.clicks[*fill as usize] = *click;
                 *fill += 1;
-                if end - first <= INSERTED_CLICKS {
-                    while at > first && click_order(&g.clicks[at - 1], click).is_gt() {
-                        g.clicks[at] = g.clicks[at - 1];
-                        at -= 1;
-                    }
-                }
-                g.clicks[at] = *click;
             }
         }
     }
@@ -440,19 +432,12 @@ pub fn run_bucket(event_parts: &[Vec<Event>], click_parts: &[Vec<Click>], rules:
         let times = &g.times[g.event_off[t] as usize..g.event_off[t + 1] as usize];
         let purchases = &g.purchases[g.purchase_off[t] as usize..g.purchase_off[t + 1] as usize];
         let clicks = &mut g.clicks[g.click_off[t] as usize..g.click_off[t + 1] as usize];
-        if clicks.len() > INSERTED_CLICKS {
-            clicks.sort_unstable_by(click_order);
+        if clicks.len() > 1 {
+            clicks.sort_unstable_by_key(|click| click.ts);
         }
         person_rows(g.persons.list[t], times, purchases, clicks, rules, person, rows, counts)?;
     }
     Ok(())
-}
-
-const INSERTED_CLICKS: usize = 32;
-
-#[inline(always)]
-fn click_order(a: &Click, b: &Click) -> std::cmp::Ordering {
-    a.ts.cmp(&b.ts).then_with(|| a.id.cmp_bytes(b.id))
 }
 
 const SHORT_RUN: usize = 16;
@@ -524,7 +509,11 @@ fn person_rows(person: Key, times: &[u32], purchases: &[u64], clicks: &[Click], 
             }
             seen += 1;
         }
-        let campaign = if seen > 0 && start - clicks[seen - 1].ts <= WEEK { clicks[run].campaign } else { 0 };
+        let campaign = if seen > 0 && start - clicks[seen - 1].ts <= WEEK {
+            clicks[run + 1..seen].iter().fold(&clicks[run], |best, click| if click.id.cmp_bytes(best.id).is_lt() { click } else { best }).campaign
+        } else {
+            0
+        };
         let cell = counts.cell(campaign, day);
         counts.sessions[cell] += 1;
         if session.revenue > 0 {
@@ -779,7 +768,7 @@ mod tests {
         for person in [few, many] {
             clicks.extend([click(person, "kz", start - 10, 1), click(person, "k1", start - 10, 4), click(person, "k-2", start - 10, 3), click(person, "k0", start - 20, 2)]);
         }
-        clicks.extend((0..2 * INSERTED_CLICKS as i32).map(|i| click(many, &format!("m{i}"), start - 1000 - i, 2)));
+        clicks.extend((0..64).map(|i| click(many, &format!("m{i}"), start - 1000 - i, 2)));
         clicks.reverse();
         let mut scratch = Scratch::new(5, days);
         let mut rows = UserRows::default();
@@ -867,7 +856,7 @@ mod tests {
         events.retain(|e| e.ts < end);
         clicks.retain(|c| c.ts >= -WEEK && c.ts < end);
         assert!(events.iter().filter(|e| e.person == Key::from_bytes(b"u0")).count() >= 512);
-        assert!(clicks.iter().filter(|c| c.person == Key::from_bytes(b"u0")).count() > INSERTED_CLICKS);
+        assert!(clicks.iter().filter(|c| c.person == Key::from_bytes(b"u0")).count() > 32);
         for i in (1..events.len()).rev() {
             events.swap(i, next(i as u64 + 1) as usize);
         }

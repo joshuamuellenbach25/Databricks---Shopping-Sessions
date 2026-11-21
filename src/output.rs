@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -53,54 +53,67 @@ fn writer(file: File, schema: &str) -> Result<SerializedFileWriter<File>, Fail> 
 
 pub struct Parts {
     dir: PathBuf,
+    taken: Vec<usize>,
+    stale: Vec<PathBuf>,
 }
 
 impl Parts {
-    pub fn new(dir: PathBuf) -> Parts {
-        Parts { dir }
+    pub fn new(dir: PathBuf) -> Result<Parts, String> {
+        let failed = |e: io::Error| format!("{}: {e}", dir.display());
+        let (mut taken, mut stale) = (Vec::new(), Vec::new());
+        for entry in std::fs::read_dir(&dir).map_err(failed)? {
+            let entry = entry.map_err(failed)?;
+            let Some((part, published)) = entry.file_name().to_str().and_then(solver_part) else {
+                continue;
+            };
+            if published {
+                taken.push(part);
+            }
+            if entry.file_type().map_err(failed)?.is_file() {
+                stale.push(entry.path());
+            }
+        }
+        taken.sort_unstable();
+        Ok(Parts { dir, taken, stale })
     }
 
-    pub fn staging(&self, part: usize) -> PathBuf {
-        self.dir.join(staging_name(part))
+    pub fn path(&self, part: usize) -> PathBuf {
+        let mut number = part;
+        for &taken in &self.taken {
+            if taken > number {
+                break;
+            }
+            number += 1;
+        }
+        self.dir.join(part_name(number))
     }
 
     pub fn create(&self, part: usize) -> Result<File, String> {
-        let path = self.staging(part);
+        let path = self.path(part);
         File::create(&path).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    pub fn publish(&self, written: &[usize]) -> Result<(), String> {
-        for &part in written {
-            let (from, to) = (self.staging(part), self.dir.join(part_name(part)));
-            std::fs::rename(&from, &to).map_err(|e| format!("{} to {}: {e}", from.display(), to.display()))?;
-        }
-        let failed = |e: io::Error| format!("{}: {e}", self.dir.display());
-        for entry in std::fs::read_dir(&self.dir).map_err(failed)? {
-            let entry = entry.map_err(failed)?;
-            let stale = match entry.file_name().to_str().and_then(solver_part) {
-                Some((part, true)) => !written.contains(&part),
-                Some((_, false)) => true,
-                None => false,
-            };
-            if stale && entry.file_type().map_err(failed)?.is_file() {
-                let path = entry.path();
-                std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            }
-        }
-        Ok(())
+    pub fn remove(&self, part: usize) -> Result<(), String> {
+        remove_file(&self.path(part))
     }
 
     pub fn discard(&self, parts: usize) -> Result<(), String> {
-        for part in 0..parts {
-            let path = self.staging(part);
-            if let Err(e) = std::fs::remove_file(&path) {
-                if e.kind() != io::ErrorKind::NotFound {
-                    return Err(format!("{}: {e}", path.display()));
-                }
-            }
-        }
-        Ok(())
+        (0..parts).try_for_each(|part| self.remove(part))
     }
+}
+
+fn remove_file(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(format!("{}: {e}", path.display())),
+        _ => Ok(()),
+    }
+}
+
+pub fn publish(tables: &[&Parts]) -> Result<(), String> {
+    std::thread::scope(|scope| {
+        let removers: Vec<_> = tables.iter().flat_map(|parts| &parts.stale).map(|path| scope.spawn(move || remove_file(path))).collect();
+        removers.into_iter().try_for_each(|remover| remover.join().unwrap())
+    })
 }
 
 fn part_name(part: usize) -> String {
@@ -125,29 +138,31 @@ pub struct UserDaily {
     file: SerializedFileWriter<File>,
     names: Vec<ByteArray>,
     values: Vec<ByteArray>,
+    text: Vec<u8>,
+    ends: Vec<usize>,
 }
 
 impl UserDaily {
     pub fn create(file: File, categories: &'static [Vec<u8>]) -> Result<UserDaily, Fail> {
         let names = categories.iter().map(|c| ByteArray::from(Bytes::from_static(c))).collect();
-        Ok(UserDaily { file: writer(file, USER_DAILY)?, names, values: Vec::new() })
+        Ok(UserDaily { file: writer(file, USER_DAILY)?, names, values: Vec::new(), text: Vec::new(), ends: Vec::new() })
     }
 
     pub fn write(&mut self, rows: &UserRows) -> Result<(), Fail> {
-        let mut group = self.file.next_row_group()?;
-        let mut text = Vec::with_capacity(rows.persons.len() * 10);
-        let mut ends = Vec::with_capacity(rows.persons.len());
+        self.values.clear();
+        self.text.clear();
+        self.ends.clear();
         let spelling = ids::spelling();
         for &(person, _) in &rows.persons {
-            spelling.append(person, &mut text);
-            ends.push(text.len());
+            spelling.append(person, &mut self.text);
+            self.ends.push(self.text.len());
         }
         drop(spelling);
-        let text = Bytes::from(text);
-        self.values.clear();
+        let mut group = self.file.next_row_group()?;
         let mut start = 0;
-        for (&(_, count), &end) in rows.persons.iter().zip(&ends) {
-            self.values.extend((0..count).map(|_| ByteArray::from(text.slice(start..end))));
+        for (&(_, count), &end) in rows.persons.iter().zip(&self.ends) {
+            let id: &'static [u8] = unsafe { std::slice::from_raw_parts(self.text.as_ptr().add(start), end - start) };
+            self.values.extend((0..count).map(|_| ByteArray::from(Bytes::from_static(id))));
             start = end;
         }
         column_bytes(&mut group, &self.values, None)?;
@@ -168,13 +183,13 @@ impl UserDaily {
     }
 }
 
-pub fn write_campaign_daily(parts: &Parts, part: usize, accum: &Accum, campaigns: &Campaigns, share: Range<usize>, base_day: i32, keep_empty: bool) -> Result<bool, String> {
+pub fn write_campaign_daily(file: File, accum: &Accum, campaigns: &'static Campaigns, share: Range<usize>, base_day: i32) -> Result<usize, Fail> {
     let mut ids = Vec::new();
     let mut channels = Vec::new();
     let mut days = Vec::new();
     let mut columns: [Vec<i64>; 4] = Default::default();
     for campaign in share {
-        let (name, channel) = (ByteArray::from(campaigns.ids[campaign].clone()), ByteArray::from(campaigns.channels[campaign].clone()));
+        let (name, channel) = (ByteArray::from(Bytes::from_static(&campaigns.ids[campaign])), ByteArray::from(Bytes::from_static(&campaigns.channels[campaign])));
         for day in 0..accum.days {
             let cell = accum.cells[campaign * accum.days + day];
             if cell.sessions == 0 && cell.assisted == 0 {
@@ -189,12 +204,8 @@ pub fn write_campaign_daily(parts: &Parts, part: usize, accum: &Accum, campaigns
             columns[3].push(cell.assisted);
         }
     }
-    if ids.is_empty() && !keep_empty {
-        return Ok(false);
-    }
-    let file = parts.create(part)?;
-    write_campaign_rows(file, &ids, &channels, &days, &columns).map_err(|e| format!("{}: {e}", parts.staging(part).display()))?;
-    Ok(true)
+    write_campaign_rows(file, &ids, &channels, &days, &columns)?;
+    Ok(ids.len())
 }
 
 fn write_campaign_rows(file: File, ids: &[ByteArray], channels: &[ByteArray], days: &[i32], columns: &[Vec<i64>; 4]) -> Result<(), Fail> {
@@ -240,6 +251,8 @@ mod tests {
     use std::path::Path;
 
     use hashbrown::HashMap;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::RowAccessor;
 
     use super::*;
     use crate::ids::Key;
@@ -295,18 +308,21 @@ mod tests {
             std::fs::write(dir.join(name), b"old").unwrap();
         }
         std::fs::create_dir(dir.join("part-005.parquet")).unwrap();
-        let parts = Parts::new(dir.clone());
+        let parts = Parts::new(dir.clone()).unwrap();
         for part in [0, 2] {
             parts.create(part).unwrap().write_all(format!("new {part}").as_bytes()).unwrap();
         }
+        assert_eq!((parts.path(0), parts.path(2)), (dir.join("part-004.parquet"), dir.join("part-007.parquet")));
         assert_eq!(std::fs::read(dir.join("part-000.parquet")).unwrap(), b"old");
-        parts.publish(&[0, 2]).unwrap();
+        publish(&[&parts]).unwrap();
         let mut want = foreign.to_vec();
-        want.extend(["part-000.parquet", "part-002.parquet", "part-005.parquet"]);
+        want.extend(["part-004.parquet", "part-005.parquet", "part-007.parquet"]);
         assert_eq!(names(&dir), sorted(&want));
-        assert_eq!(std::fs::read(dir.join("part-000.parquet")).unwrap(), b"new 0");
-        assert_eq!(std::fs::read(dir.join("part-002.parquet")).unwrap(), b"new 2");
+        assert_eq!(std::fs::read(dir.join("part-004.parquet")).unwrap(), b"new 0");
+        assert_eq!(std::fs::read(dir.join("part-007.parquet")).unwrap(), b"new 2");
         assert!(dir.join("part-005.parquet").is_dir());
+        let next = Parts::new(dir.clone()).unwrap();
+        assert_eq!((next.path(0), next.path(4)), (dir.join("part-000.parquet"), dir.join("part-006.parquet")));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -315,7 +331,7 @@ mod tests {
         let dir = temp_dir("discard");
         std::fs::write(dir.join("part-000.parquet"), b"old 0").unwrap();
         std::fs::write(dir.join("part-001.parquet"), b"old 1").unwrap();
-        let parts = Parts::new(dir.clone());
+        let parts = Parts::new(dir.clone()).unwrap();
         for part in 0..2 {
             parts.create(part).unwrap().write_all(b"half written").unwrap();
         }
@@ -329,26 +345,34 @@ mod tests {
     }
 
     #[test]
-    fn empty_campaign_shares_write_no_file() {
-        let dir = temp_dir("shares");
-        let parts = Parts::new(dir.clone());
-        let organic = catalog(1);
-        let mut accum = Accum::new(1, 2);
-        let shares = |accum: &Accum| -> Vec<usize> { (0..8).filter(|&part| write_campaign_daily(&parts, part, accum, &organic, part / 8..(part + 1) / 8, 20_362, false).unwrap()).collect() };
-        assert_eq!(shares(&accum), Vec::<usize>::new());
-        assert!(names(&dir).is_empty());
+    fn campaign_shares_hold_a_row_per_day_with_a_session_or_an_assist() {
+        let dir = temp_dir("campaign");
+        let parts = Parts::new(dir.clone()).unwrap();
+        let campaigns: &'static Campaigns = Box::leak(Box::new(catalog(3)));
+        let mut accum = Accum::new(3, 2);
+        let rows_in = |accum: &Accum, part: usize, share: Range<usize>| {
+            let rows = write_campaign_daily(parts.create(part).unwrap(), accum, campaigns, share, 20_362).unwrap();
+            let read = SerializedFileReader::new(File::open(parts.path(part)).unwrap()).unwrap().metadata().file_metadata().num_rows();
+            assert_eq!(read, rows as i64);
+            rows
+        };
+        assert_eq!(rows_in(&accum, 0, 0..3), 0);
         accum.cells[1].sessions = 3;
-        assert_eq!(shares(&accum), [7]);
-        assert!(write_campaign_daily(&parts, 0, &accum, &organic, 0..0, 20_362, true).unwrap());
-        parts.publish(&[0, 7]).unwrap();
-        assert_eq!(names(&dir), sorted(&["part-000.parquet", "part-007.parquet"]));
+        accum.cells[2].assisted = 1;
+        accum.cells[3].purchasing = 1;
+        accum.cells[5].sessions = 1;
+        assert_eq!(rows_in(&accum, 0, 0..1), 1);
+        assert_eq!(rows_in(&accum, 1, 1..3), 2);
+        assert_eq!(rows_in(&accum, 2, 3..3), 0);
+        publish(&[&parts]).unwrap();
+        assert_eq!(names(&dir), sorted(&["part-000.parquet", "part-001.parquet", "part-002.parquet"]));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn user_daily_writers_share_one_category_catalog() {
         let dir = temp_dir("catalog");
-        let parts = Parts::new(dir.clone());
+        let parts = Parts::new(dir.clone()).unwrap();
         let categories = categories();
         for part in 0..3 {
             let writer = UserDaily::create(parts.create(part).unwrap(), categories).unwrap();
@@ -361,34 +385,57 @@ mod tests {
     }
 
     #[test]
+    fn user_ids_are_copied_into_each_row_group_and_carry_no_statistics() {
+        let dir = temp_dir("ids");
+        let parts = Parts::new(dir.clone()).unwrap();
+        let mut writer = UserDaily::create(parts.create(0).unwrap(), categories()).unwrap();
+        let mut later = rows();
+        later.persons = vec![(Key::from_bytes(b"a user id longer than ten bytes"), 2), (Key::from_bytes(b"u3"), 1)];
+        writer.write(&rows()).unwrap();
+        writer.write(&later).unwrap();
+        writer.close().unwrap();
+        let reader = SerializedFileReader::new(File::open(parts.path(0)).unwrap()).unwrap();
+        let ids: Vec<String> = reader.get_row_iter(None).unwrap().map(|row| row.unwrap().get_string(0).unwrap().clone()).collect();
+        assert_eq!(ids, ["u1", "u1", "u2", "a user id longer than ten bytes", "a user id longer than ten bytes", "u3"]);
+        for group in reader.metadata().row_groups() {
+            assert!(group.columns().iter().all(|column| column.statistics().is_none()));
+        }
+        drop(reader);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn closed_writers_leave_no_allocation_behind() {
         let dir = temp_dir("leaks");
         let (user_dir, campaign_dir) = (dir.join("user_daily"), dir.join("campaign_daily"));
         std::fs::create_dir_all(&user_dir).unwrap();
         std::fs::create_dir_all(&campaign_dir).unwrap();
         let categories = categories();
-        let campaigns = catalog(3);
+        let campaigns: &'static Campaigns = Box::leak(Box::new(catalog(3)));
         let mut accum = Accum::new(3, 2);
         accum.cells[1].sessions = 4;
         accum.cells[2].assisted = 1;
         accum.cells[5].sessions = 2;
         let rows = rows();
         let round = || {
-            let users = Parts::new(user_dir.clone());
+            let users = Parts::new(user_dir.clone()).unwrap();
             let mut writer = UserDaily::create(users.create(0).unwrap(), categories).unwrap();
             writer.write(&rows).unwrap();
             writer.write(&rows).unwrap();
             writer.close().unwrap();
-            users.publish(&[0]).unwrap();
-            let shares = Parts::new(campaign_dir.clone());
-            let written: Vec<usize> = (0..2).filter(|&part| write_campaign_daily(&shares, part, &accum, &campaigns, part * 3 / 2..(part + 1) * 3 / 2, 20_362, false).unwrap()).collect();
-            assert_eq!(written, [0, 1]);
-            shares.publish(&written).unwrap();
+            let shares = Parts::new(campaign_dir.clone()).unwrap();
+            let written: Vec<usize> = (0..2).map(|part| write_campaign_daily(shares.create(part).unwrap(), &accum, campaigns, part * 3 / 2..(part + 1) * 3 / 2, 20_362).unwrap()).collect();
+            assert_eq!(written, [1, 2]);
+            (users, shares)
         };
-        round();
+        drop(round());
         let before = crate::tests::live_bytes();
-        round();
+        drop(round());
         assert_eq!(crate::tests::live_bytes(), before);
+        let (users, shares) = round();
+        publish(&[&users, &shares]).unwrap();
+        assert_eq!(names(&user_dir), sorted(&["part-002.parquet"]));
+        assert_eq!(names(&campaign_dir), sorted(&["part-004.parquet", "part-005.parquet"]));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
