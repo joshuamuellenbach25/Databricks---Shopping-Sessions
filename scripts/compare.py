@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Exact, order-insensitive diff of two output folders. Usage: compare.py OUT_A OUT_B"""
 from pathlib import Path
 import sys
 

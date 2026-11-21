@@ -4,9 +4,6 @@ pub const HOUR: i64 = 60 * MINUTE;
 pub const DAY: i64 = 24 * HOUR;
 pub const WEEK: i64 = 7 * DAY;
 
-/// Parses the three valid forms (F1 `2026-10-03T23:58:10Z`, F2 with a
-/// `+HH:MM` or `-HH:MM` offset, F3 epoch milliseconds in ASCII digits) into
-/// UTC epoch milliseconds. Anything else is None.
 #[inline]
 pub fn parse(b: &[u8]) -> Option<i64> {
     match b.len() {
@@ -16,35 +13,21 @@ pub fn parse(b: &[u8]) -> Option<i64> {
     }
 }
 
-/// Days since the epoch of the UTC date holding `ms`.
 pub fn day_of(ms: i64) -> i32 {
     ms.div_euclid(DAY) as i32
 }
 
-/// The calendar months that hold a short range of days, so that `parse` on
-/// a date in them can skip the calendar arithmetic: a date's first 8 bytes
-/// (`YYYY-MM-`) name its month exactly, and the month gives the
-/// milliseconds of its day 0. Any other date takes the general path.
 #[derive(Clone, Copy, Debug)]
 pub struct Months {
-    /// `YYYY-MM-` of each month as a little-endian word.
     words: [u64; MONTHS],
-    /// Epoch milliseconds of each month's day 0, the day before its 1st.
     day0: [i64; MONTHS],
-    /// The days of each month a fast parse accepts; an unused month has
-    /// `first` above `last`, so no day takes it.
     first: [i64; MONTHS],
     last: [i64; MONTHS],
 }
 
-/// A range of up to 29 days touches at most 3 months; further months take
-/// the general path.
 const MONTHS: usize = 3;
 
 impl Months {
-    /// The months of the epoch days `from` to `to`, both included; days
-    /// past the first 93 are left to the general path. Each day is checked
-    /// against the general parse before it joins.
     pub fn new(from: i64, to: i64) -> Months {
         let mut months = Months { words: [0; MONTHS], day0: [0; MONTHS], first: [1; MONTHS], last: [0; MONTHS] };
         let mut used = 0;
@@ -77,7 +60,6 @@ impl Months {
         months
     }
 
-    /// Exactly `parse`.
     #[inline(always)]
     pub fn parse(&self, b: &[u8]) -> Option<i64> {
         match b.len() {
@@ -87,21 +69,14 @@ impl Months {
         }
     }
 
-    /// Exactly `civil`.
     #[inline(always)]
     fn civil(&self, b: &[u8; 20]) -> Option<i64> {
         let word = load(b, 0);
-        // The month without a branch per month: a window that spans two
-        // months has its dates in either at random.
         let (in0, in1, in2) = (word == self.words[0], word == self.words[1], word == self.words[2]);
         if !(in0 | in1 | in2) {
             return civil_cold(b);
         }
-        // Unused months share one word, so a word can match two of them;
-        // their empty day range then sends the date to the general path.
         let k = if in2 { 2 } else { usize::from(in1) };
-        // The month word fits `DATE`, so the date is valid when its day is
-        // one of the month's days; the time must fit as in `civil`.
         let time = pairs(fit(load(b, 8), &DAY_TIME)?);
         let seconds = pairs(fit(load(b, 12), &SECONDS)?);
         let (day, hour, minute, second) = (byte(time, 0), byte(time, 3), byte(time, 6), byte(seconds, 5));
@@ -114,7 +89,6 @@ impl Months {
         Some(self.day0[k] + day * DAY + hour * HOUR + minute * MINUTE + second * SECOND)
     }
 
-    /// Exactly `zoned`.
     #[inline(always)]
     fn zoned(&self, b: &[u8; 25]) -> Option<i64> {
         let ms = self.civil(b.first_chunk()?)?;
@@ -128,10 +102,7 @@ fn civil_cold(b: &[u8; 20]) -> Option<i64> {
     civil(b)
 }
 
-/// The proleptic Gregorian date (year, month, day) of an epoch day, for
-/// years 0 to 9999; None outside them.
 fn civil_from_days(day: i64) -> Option<(i64, i64, i64)> {
-    // Years 0 to 9999 are about days -719,528 to 2,932,896.
     if !(-800_000..=3_000_000).contains(&day) {
         return None;
     }
@@ -147,16 +118,9 @@ fn civil_from_days(day: i64) -> Option<(i64, i64, i64)> {
     (0..=9999).contains(&year).then_some((year, month, date))
 }
 
-/// Eight bytes read as one little-endian word and matched against a pattern
-/// in which `D` is an ASCII digit, `?` is any byte and every other byte
-/// stands for itself.
 struct Shape {
-    /// XORed into the word: a digit becomes its value, a matching literal 0.
     xor: u64,
-    /// Clears the bytes marked `?`.
     keep: u64,
-    /// Added to the XORed bytes: sets a byte's top bit when the byte is over
-    /// 9 at a digit or over 0 at a literal.
     over: u64,
 }
 
@@ -177,31 +141,20 @@ const fn shape(pattern: &[u8; 8]) -> Shape {
     shape
 }
 
-/// F1 and F2 bytes 0 to 7.
 const DATE: Shape = shape(b"DDDD-DD-");
-/// F1 and F2 bytes 8 to 15.
 const DAY_TIME: Shape = shape(b"DDTDD:DD");
-/// F1 and F2 bytes 12 to 19; `parse` checks byte 19, the zone or the sign.
 const SECONDS: Shape = shape(b"D:DD:DD?");
-/// F2 bytes 17 to 24; `parse` checks byte 19, the sign.
 const OFFSET: Shape = shape(b"DD?DD:DD");
 const DIGITS: Shape = shape(b"DDDDDDDD");
 
 const TOP_BITS: u64 = 0x8080_8080_8080_8080;
-/// Multipliers that join two-digit numbers into four-digit ones, and those
-/// into one eight-digit number.
 const PAIRS_TO_FOURS: u64 = 1 + (100 << 16);
 const FOURS_TO_EIGHT: u64 = 1 + (10_000 << 32);
 
-/// Days in each month of a common year by month number, 0 for the numbers
-/// that name no month.
 const MONTH_DAYS: [i64; 16] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 0, 0, 0];
 
-/// Days from March 1 to the first of each month by month number, with
-/// January and February at the end of a year that starts in March.
 const MARCH_DAYS: [i64; 16] = march_days();
 
-/// The day count of `civil` on 1970-01-01.
 const EPOCH: i64 = 865_565;
 
 const fn march_days() -> [i64; 16] {
@@ -219,16 +172,12 @@ fn load(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
-/// The word's digit values, with 0 in every other byte, when it fits the
-/// shape; None when any byte does not.
 #[inline(always)]
 fn fit(word: u64, shape: &Shape) -> Option<u64> {
     let values = (word ^ shape.xor) & shape.keep;
     (((values | values.wrapping_add(shape.over)) & TOP_BITS) == 0).then_some(values)
 }
 
-/// Byte i becomes 10 * v[i] + v[i + 1] for byte values v of at most 9: the
-/// two-digit number that starts at byte i.
 #[inline(always)]
 fn pairs(v: u64) -> u64 {
     v.wrapping_mul(10).wrapping_add(v >> 8)
@@ -239,8 +188,6 @@ fn byte(word: u64, i: u32) -> i64 {
     ((word >> (8 * i)) & 0xFF) as i64
 }
 
-/// F1, and the civil time of F2: bytes 0 to 18, with byte 19 checked by
-/// `parse`.
 #[inline(always)]
 fn civil(b: &[u8; 20]) -> Option<i64> {
     let date = pairs(fit(load(b, 0), &DATE)?);
@@ -248,8 +195,6 @@ fn civil(b: &[u8; 20]) -> Option<i64> {
     let seconds = pairs(fit(load(b, 12), &SECONDS)?);
     let (century, year_in_century, month) = (byte(date, 0), byte(date, 2), byte(date, 5));
     let (day, hour, minute, second) = (byte(time, 0), byte(time, 3), byte(time, 6), byte(seconds, 5));
-    // A leap year is one that 4 divides, except the years 100 divides and
-    // 400 does not.
     let leap = (if year_in_century == 0 { century } else { year_in_century }) % 4 == 0;
     let m = (month & 15) as usize;
     let month_days = MONTH_DAYS[m] + i64::from(leap && month == 2);
@@ -261,21 +206,17 @@ fn civil(b: &[u8; 20]) -> Option<i64> {
     if !valid {
         return None;
     }
-    // Years start in March, so a leap day ends its year; the 400 added years
-    // keep the count positive from year 0 on.
     let y = (century * 100 + year_in_century + 400 - i64::from(month <= 2)) as u64;
     let days = (365 * y + y / 4 - y / 100 + y / 400) as i64 + MARCH_DAYS[m] + day - 1 - EPOCH;
     Some(days * DAY + hour * HOUR + minute * MINUTE + second * SECOND)
 }
 
-/// F2: the civil time with its `+HH:MM` or `-HH:MM` offset taken off.
 #[inline(always)]
 fn zoned(b: &[u8; 25]) -> Option<i64> {
     let ms = civil(b.first_chunk()?)?;
     offset(b, ms)
 }
 
-/// The civil time `ms` of F2 `b` with the offset in bytes 19 to 24 taken off.
 #[inline(always)]
 fn offset(b: &[u8; 25], ms: i64) -> Option<i64> {
     let offset = pairs(fit(load(b, 17), &OFFSET)?);
@@ -287,23 +228,18 @@ fn offset(b: &[u8; 25], ms: i64) -> Option<i64> {
     Some(if b[19] == b'-' { ms + offset } else { ms - offset })
 }
 
-/// F3. From 9 to 16 bytes are read as two words of 8 digits; other lengths
-/// byte by byte.
 #[inline(always)]
 fn digits(b: &[u8]) -> Option<i64> {
     let n = b.len();
     if !(9..=16).contains(&n) {
         return digits_by_byte(b);
     }
-    // The high word holds 16 - n zeros, then the first n - 8 bytes; the low
-    // word holds the last 8.
     let shift = 8 * (16 - n) as u32;
     let high = fit((load(b, 0) << shift) | (DIGITS.xor & !(u64::MAX << shift)), &DIGITS)?;
     let low = fit(load(b, n - 8), &DIGITS)?;
     Some((eight(high) * 100_000_000 + eight(low)) as i64)
 }
 
-/// The number written by 8 digit values, the first in the lowest byte.
 #[inline(always)]
 fn eight(v: u64) -> u64 {
     let v = pairs(v) & 0x00FF_00FF_00FF_00FF;
@@ -332,8 +268,6 @@ fn digit(c: u8) -> Option<i64> {
 mod tests {
     use super::*;
 
-    /// The byte-at-a-time parser that the word-at-a-time one must agree with
-    /// on every input.
     mod reference {
         use crate::timestamp::{DAY, HOUR, MINUTE, SECOND};
 
@@ -543,7 +477,6 @@ mod tests {
         }
     }
 
-    /// Writes `value` into `out` as decimal digits, zeros on the left.
     fn put(out: &mut [u8], mut value: usize) {
         for c in out.iter_mut().rev() {
             *c = b'0' + (value % 10) as u8;
@@ -572,7 +505,6 @@ mod tests {
             }
         }
         assert_eq!(accepted, 3_652_425);
-        // Every two-digit month and day in years at the leap-rule edges.
         let mut accepted = 0;
         for year in [0, 1, 4, 100, 400, 1900, 1970, 2000, 2024, 2025, 2026, 2027, 2028, 2100, 9999] {
             put(&mut text[0..4], year);
@@ -584,7 +516,6 @@ mod tests {
                 }
             }
         }
-        // Years 0, 4, 400, 2000, 2024 and 2028 are leap years; the other 9 are not.
         assert_eq!(accepted, 9 * 365 + 6 * 366);
     }
 
@@ -627,7 +558,6 @@ mod tests {
         let mut accepted = 0;
         for number in numbers {
             for len in 0..=25 {
-                // Leading zeros up to `len` bytes, or the last `len` digits.
                 let text: Vec<u8> = if len >= number.len() {
                     std::iter::repeat(b'0').take(len - number.len()).chain(number.bytes()).collect()
                 } else {
@@ -663,7 +593,6 @@ mod tests {
         }
     }
 
-    /// A small deterministic generator (splitmix64) for the randomized tests.
     struct Rng(u64);
 
     impl Rng {
@@ -744,8 +673,6 @@ mod tests {
         assert_eq!(civil_from_days(days_from_civil(2028, 2, 29)), Some((2028, 2, 29)));
     }
 
-    /// Month tables for ranges in one month, across a month end, a year end,
-    /// February 29 and a century year's February, plus an empty one.
     fn month_tables() -> Vec<(Months, i64, i64)> {
         let mut tables = Vec::new();
         for (from, to) in [((2025, 7, 15), (2025, 8, 5)), ((2026, 1, 20), (2026, 2, 12)), ((2027, 12, 20), (2028, 1, 10)), ((2028, 2, 14), (2028, 3, 8)), ((2100, 2, 20), (2100, 3, 3)), ((2026, 1, 25), (2026, 3, 3))] {
@@ -783,7 +710,6 @@ mod tests {
     #[test]
     fn months_take_the_first_93_days_of_a_long_range() {
         for months in [Months::new(0, i64::MAX), Months::new(0, 400)] {
-            // January to March 1970; April 1 to 3 would need a fourth month.
             let days: i64 = (0..MONTHS).map(|k| (months.last[k] - months.first[k] + 1).max(0)).sum();
             assert_eq!(days, 31 + 28 + 31);
             for text in [&b"1970-02-14T00:00:00Z"[..], b"1970-04-02T00:00:00Z", b"1970-12-31T23:59:59Z"] {
@@ -833,7 +759,6 @@ mod tests {
                     }
                 }
             }
-            // A date word of zero bytes matches the unused months' word.
             months_agree(&months, &[0u8; 20]);
             months_agree(&months, &[[0u8; 19].as_slice(), b"Z"].concat());
             months_agree(&months, &[[0u8; 8].as_slice(), b"31T00:00:00Z"].concat());

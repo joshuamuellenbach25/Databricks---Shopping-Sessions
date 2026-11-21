@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-Runs an implementation on every fixture and compares both output tables
-with the hand-written expected CSVs (exact, order-insensitive).
-
-Usage: python run_fixtures.py FIXTURES_DIR, then a double-hyphen separator, then CMD...
-CMD gets DATA_DIR and OUTPUT_DIR as env vars and as the last two arguments.
-The Makefile's fixtures and fixtures-native targets show the full command line.
-"""
 import os
 from pathlib import Path
 import subprocess

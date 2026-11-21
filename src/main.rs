@@ -27,16 +27,12 @@ type Fail = Box<dyn std::error::Error + Send + Sync>;
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// `mi_option_purge_delay` in the `mi_option_t` enum of the linked mimalloc (3.3).
 const MI_OPTION_PURGE_DELAY: c_int = 15;
 
 extern "C" {
     fn mi_option_set(option: c_int, value: c_long);
 }
 
-/// Stops mimalloc from returning freed memory to the kernel during the run:
-/// memory one phase frees stays mapped and is reused by later phases instead
-/// of being faulted in and zeroed again.
 fn keep_freed_memory() {
     unsafe { mi_option_set(MI_OPTION_PURGE_DELAY, -1) };
 }
@@ -164,8 +160,6 @@ fn run() -> Result<(), Fail> {
     let sessions_total: i64 = total.cells.iter().map(|c| c.sessions).sum();
     eprintln!("sessions: {sessions_total}");
     check_output(&out)?;
-    // Every output file is written and closed, so exit here instead of
-    // returning: returning would free every record buffer one by one first.
     std::process::exit(0)
 }
 
@@ -197,7 +191,6 @@ mod tests {
 
     #[test]
     fn freed_memory_stays_mapped() {
-        // 1000 ms is the linked mimalloc's default purge delay, so the index names that option.
         assert_eq!(unsafe { mi_option_get(MI_OPTION_PURGE_DELAY) }, 1000);
         keep_freed_memory();
         assert_eq!(unsafe { mi_option_get(MI_OPTION_PURGE_DELAY) }, -1);

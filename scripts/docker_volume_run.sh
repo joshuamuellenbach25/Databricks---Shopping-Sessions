@@ -1,9 +1,4 @@
 #!/bin/sh
-# Runs the solver image with the scorer's container flags, reading a dataset
-# from a Docker volume so that file access stays inside the Linux VM.
-# Usage: scripts/docker_volume_run.sh DATA_VOLUME OUTPUT_VOLUME [IMAGE]
-# CPUS and MEM override the 8 CPUs and 24g memory limit. SOLVER_ENV adds
-# space-separated NAME=VALUE pairs to the container environment.
 set -eu
 export MSYS_NO_PATHCONV=1
 DATA=$1

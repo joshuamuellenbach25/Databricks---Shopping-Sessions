@@ -6,8 +6,6 @@ use crate::lookups::{Campaigns, Window};
 use crate::people::People;
 use crate::timestamp::{self, WEEK};
 
-/// A valid click, keyed by its person. `ts` is milliseconds from the window
-/// start, negative for a click in the 7 days before it.
 #[derive(Clone, Copy)]
 pub struct Click {
     pub person: Key,
@@ -26,7 +24,6 @@ pub struct Context<'a> {
     pub people: &'a People,
 }
 
-/// A valid click with its user ID in `person`; the person is resolved later.
 fn parse_click(fields: &[&[u8]; 4], ctx: &Context) -> Option<Click> {
     if fields[0].is_empty() || fields[1].is_empty() {
         return None;
@@ -44,9 +41,6 @@ fn parse_click(fields: &[&[u8]; 4], ctx: &Context) -> Option<Click> {
     })
 }
 
-/// One scan thread's clicks by person bucket. A parsed click waits in `ring`
-/// while its person table slot is prefetched, then takes its person's name
-/// and goes straight into its bucket, so each click is stored once.
 struct Filed {
     buckets: Vec<Vec<Click>>,
     ring: [Click; PREFETCH_AHEAD],
@@ -64,8 +58,6 @@ impl Filed {
         self.buckets[click.person.bucket(PERSON_BITS)].push(click);
     }
 
-    /// Starts the person lookup of a parsed click and files the click parsed
-    /// `PREFETCH_AHEAD` clicks before it.
     #[inline(always)]
     fn take(&mut self, click: Click, people: &People) {
         people.prefetch(click.person);
@@ -78,7 +70,6 @@ impl Filed {
         self.parsed += 1;
     }
 
-    /// Files the clicks still waiting in the ring and returns the buckets.
     fn finish(mut self, people: &People) -> Vec<Vec<Click>> {
         for n in self.parsed.saturating_sub(PREFETCH_AHEAD)..self.parsed {
             let click = self.ring[n % PREFETCH_AHEAD];
@@ -88,9 +79,6 @@ impl Filed {
     }
 }
 
-/// Reads every click file and returns the valid clicks bucketed by person.
-/// Copies of a click have identical values, so they need no dedup: a repeated
-/// click credits and assists exactly as one copy does.
 pub fn collect(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Result<Buckets<Click>> {
     let bytes = crate::scan::total_size(paths)? as usize;
     let per_bucket = bytes / 45 / threads / PERSON_BUCKETS + 16;
@@ -116,8 +104,6 @@ mod tests {
 
     type Filing = (Vec<u8>, Vec<u8>, i64);
 
-    /// Writes a click file with `count` valid clicks and one with an unknown
-    /// campaign, and returns each valid click as (click_id, name, stored ts).
     fn write_clicks(dir: &std::path::Path, file: usize, count: usize, window: Window) -> Vec<Filing> {
         let mut text = String::from("click_id,user_id,campaign_id,ts\n");
         let mut expected = Vec::new();

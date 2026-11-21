@@ -2,10 +2,6 @@ use hashbrown::HashMap;
 
 use crate::ids::Key;
 
-/// Linked IDs joined into persons. `name_of` gives the person's name (the
-/// byte-wise smallest of its IDs); an ID in no link names itself. Names live
-/// in an open-addressing table of (id, name) words; id 0 marks an empty slot,
-/// which no linked ID can be because links with an empty side are dropped.
 pub struct People {
     slots: Vec<[u64; 2]>,
     mask: usize,
@@ -73,7 +69,6 @@ impl People {
         (key.0.wrapping_mul(SLOT_MIX) >> self.shift) as usize
     }
 
-    /// Starts loading the slot `name_of(key)` reads first.
     #[inline(always)]
     pub fn prefetch(&self, key: Key) {
         #[cfg(target_arch = "x86_64")]
