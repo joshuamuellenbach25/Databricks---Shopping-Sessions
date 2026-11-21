@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 07:42 UTC.
+Updated 2026-11-21 07:44 UTC.
 
 | Item | Value |
 |---|---|
@@ -18,8 +18,8 @@ Updated 2026-11-21 07:42 UTC.
 | opt/cand2 | main plus the opt/people2 change, comments stripped | 0d40115; gates pass; Codex found no output defect; pinned bench median 1067 ms against 1070 ms for main, faster in 6 of 15 low-load rounds; not submitted |
 | opt/main-fix1 | quoted CPU pinning in the volume runner, no comment lines in Cargo.lock | d05a8d9; gates pass with locked cargo (43 tests, 36/36, dev MATCH, 6/6); every cargo command locked; Codex re-review clean; merged into main |
 | opt/memexit | release memory and input mappings early to cut page zeroing and exit teardown (about 0.4 s of each local run falls after the last timed phase) | building |
-| opt/directio | Linux input reads that skip the page cache when the data is not resident, overlapped with parsing | 480b924 on the old main; fixing the confirmed Codex findings; needs a Linux bench |
-| opt/sessions2 | sessions and output rewrite (25 percent of runtime) | a90c101 on opt/cand1; sessions and output 0.174 s to 0.097 s, lower in 16 of 16 rounds; gates pass; Codex review running |
+| opt/directio | Linux input reads that skip the page cache when the data is not resident, overlapped with parsing | ee748b6 on the old main (fix: full residency report checked with non-blocking read probes); Codex re-check running; needs a Linux bench |
+| opt/sessions2 | sessions and output rewrite (25 percent of runtime) | a90c101 on opt/cand1; sessions and output 0.174 s to 0.097 s, lower in 16 of 16 rounds; gates pass; Codex confirmed 3 items (stale parts when an output folder is reused with fewer threads, empty parts left by a failed run, added comments), fixes running |
 | opt/cand3 | main plus only the opt/sessions2 change, comments stripped | 0890fe7; tests 48 passed, 36/36 fixtures, 6/6 seeds; Codex review and pinned bench running |
 | opt/nocomments | remove code comments from the shipped files with a parser | superseded: the parse2 merge removed every comment from main (parser check: 0 left) |
 | opt/parse-fix | inline timestamp parsing, word-at-a-time prices, review fix | gates pass; slower than the best scored code in a pinned 9-round bench (median 1123 ms against 1078 ms); not submitted |
