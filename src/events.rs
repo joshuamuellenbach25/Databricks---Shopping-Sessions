@@ -480,7 +480,7 @@ mod tests {
         for copy in copies {
             state[copy.event.bucket(EVENT_BITS)].push(copy);
         }
-        let people = People::build(vec![(Key::from_bytes(b"u2"), Key::from_bytes(b"u1"))], 1);
+        let people = People::build(&[vec![(Key::from_bytes(b"u2"), Key::from_bytes(b"u1"))]], 1);
         let buckets = dedup(vec![state], 2, &people);
         let mut got: Vec<(Vec<u8>, i64, u32)> = Vec::new();
         for (b, parts) in buckets.iter().enumerate() {
@@ -570,7 +570,7 @@ mod dedup_tests {
             .map(|i| (key(&format!("u{}", 2 * i)), key(&format!("u{}", 2 * i + 1))))
             .chain([(key("whale"), key("u7"))])
             .collect();
-        let people = People::build(pairs.iter().copied(), pairs.len());
+        let people = People::build(std::slice::from_ref(&pairs), 1);
         let raws = raws(200_000);
         let want = expected(&raws, &people);
         assert!(want.iter().map(Vec::len).sum::<usize>() > 150_000);
@@ -591,7 +591,7 @@ mod dedup_tests {
 
     #[test]
     fn no_events_give_every_person_bucket_empty() {
-        let people = People::build(Vec::new(), 0);
+        let people = People::build(&[], 1);
         let got = dedup(Vec::new(), 2, &people);
         assert_eq!(got.len(), PERSON_BUCKETS);
         assert!(got.iter().all(Vec::is_empty));
