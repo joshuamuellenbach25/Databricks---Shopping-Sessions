@@ -7,7 +7,7 @@ pub const WEEK: i64 = 7 * DAY;
 /// Parses the three valid forms (F1 `2026-10-03T23:58:10Z`, F2 with a
 /// `+HH:MM` or `-HH:MM` offset, F3 epoch milliseconds in ASCII digits) into
 /// UTC epoch milliseconds. Anything else is None.
-#[inline]
+#[inline(always)]
 pub fn parse(b: &[u8]) -> Option<i64> {
     match b.len() {
         20 if b[19] == b'Z' => civil(b.first_chunk()?),
@@ -78,6 +78,25 @@ const MARCH_DAYS: [i64; 16] = march_days();
 /// The day count of `civil` on 1970-01-01.
 const EPOCH: i64 = 865_565;
 
+/// Years that `civil` counts, from year 0 of its March-based count (400
+/// added years keep it positive) through year 9999.
+const COUNTED_YEARS: usize = 400 + 10_000;
+
+/// Days from 1970-01-01 to March 1 of each counted year: a table lookup in
+/// place of the three divisions of the leap-year count.
+static YEAR_DAYS: [i32; COUNTED_YEARS] = year_days();
+
+const fn year_days() -> [i32; COUNTED_YEARS] {
+    let mut days = [0; COUNTED_YEARS];
+    let mut y = 0;
+    while y < COUNTED_YEARS {
+        let n = y as i64;
+        days[y] = (365 * n + n / 4 - n / 100 + n / 400 - EPOCH) as i32;
+        y += 1;
+    }
+    days
+}
+
 const fn march_days() -> [i64; 16] {
     let mut days = [0; 16];
     let mut month = 1;
@@ -137,8 +156,8 @@ fn civil(b: &[u8; 20]) -> Option<i64> {
     }
     // Years start in March, so a leap day ends its year; the 400 added years
     // keep the count positive from year 0 on.
-    let y = (century * 100 + year_in_century + 400 - i64::from(month <= 2)) as u64;
-    let days = (365 * y + y / 4 - y / 100 + y / 400) as i64 + MARCH_DAYS[m] + day - 1 - EPOCH;
+    let y = (century * 100 + year_in_century + 400 - i64::from(month <= 2)) as usize;
+    let days = i64::from(YEAR_DAYS[y]) + MARCH_DAYS[m] + day - 1;
     Some(days * DAY + hour * HOUR + minute * MINUTE + second * SECOND)
 }
 
@@ -169,6 +188,25 @@ fn digits(b: &[u8]) -> Option<i64> {
     let high = fit((load(b, 0) << shift) | (DIGITS.xor & !(u64::MAX << shift)), &DIGITS)?;
     let low = fit(load(b, n - 8), &DIGITS)?;
     Some((eight(high) * 100_000_000 + eight(low)) as i64)
+}
+
+/// The number written by 1 to 8 ASCII digits, read as one word with `0`s
+/// filling it on the left; None when any byte is not a digit. Reads only
+/// the bytes of `b`.
+#[inline(always)]
+pub fn short_digits(b: &[u8]) -> Option<u64> {
+    let n = b.len();
+    debug_assert!((1..=8).contains(&n));
+    // The bytes of `b`, the first lowest; two overlapping halves agree.
+    let word = if n >= 4 {
+        let first = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        let last = u32::from_le_bytes([b[n - 4], b[n - 3], b[n - 2], b[n - 1]]);
+        u64::from(first) | (u64::from(last) << (8 * (n - 4)))
+    } else {
+        u64::from(b[0]) | (u64::from(b[n / 2]) << (8 * (n / 2))) | (u64::from(b[n - 1]) << (8 * (n - 1)))
+    };
+    let shift = 8 * (8 - n) as u32;
+    Some(eight(fit((word << shift) | (DIGITS.xor & !(u64::MAX << shift)), &DIGITS)?))
 }
 
 /// The number written by 8 digit values, the first in the lowest byte.

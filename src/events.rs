@@ -121,7 +121,20 @@ pub type Parsed = Vec<Vec<Vec<Raw>>>;
 /// Surviving events per person bucket, split into parts that together hold the bucket.
 pub type Buckets<T> = Vec<Vec<Vec<T>>>;
 
+/// A price: digits only, from 1 to 10,000,000. Up to 8 digits are read as
+/// one word; longer prices (leading zeros) byte by byte.
+#[inline(always)]
 fn parse_price(b: &[u8]) -> Option<u32> {
+    if !(1..=8).contains(&b.len()) {
+        return parse_price_by_byte(b);
+    }
+    let value = timestamp::short_digits(b)?;
+    (1..=10_000_000).contains(&value).then_some(value as u32)
+}
+
+#[cold]
+#[inline(never)]
+fn parse_price_by_byte(b: &[u8]) -> Option<u32> {
     if b.is_empty() {
         return None;
     }
@@ -138,6 +151,7 @@ fn parse_price(b: &[u8]) -> Option<u32> {
     (value >= 1).then_some(value as u32)
 }
 
+#[inline(always)]
 fn parse_event(fields: &[&[u8]; 7], ctx: &Context) -> Option<Raw> {
     let event = fields[0];
     if event.is_empty() {
@@ -326,6 +340,41 @@ mod tests {
 
     fn raw(ctx: &Context, fields: [&str; 7]) -> Raw {
         parse_event(&fields.map(str::as_bytes), ctx).unwrap()
+    }
+
+    #[test]
+    fn parse_price_agrees_with_the_byte_at_a_time_reading() {
+        let mut texts: Vec<Vec<u8>> = Vec::new();
+        for value in [0u64, 1, 9, 10, 250, 9_999_999, 10_000_000, 10_000_001, 12_345_678, 99_999_999] {
+            for width in 1..=12 {
+                let text = format!("{value:0width$}");
+                if text.len() <= 12 {
+                    texts.push(text.into_bytes());
+                }
+            }
+        }
+        let base = b"12345678";
+        for len in 1..=8 {
+            for at in 0..len {
+                for c in 0..=255u8 {
+                    let mut text = base[..len].to_vec();
+                    text[at] = c;
+                    texts.push(text);
+                }
+            }
+        }
+        texts.extend([&b""[..], b"-5", b"+5", b"2.5", b"1e3", b"5 ", b" 5", b"\xd9\xa2"].map(<[u8]>::to_vec));
+        let mut accepted = 0;
+        for text in &texts {
+            let got = parse_price(text);
+            assert_eq!(got, parse_price_by_byte(text), "{:?}", String::from_utf8_lossy(text));
+            accepted += usize::from(got.is_some());
+        }
+        assert!(accepted > 100, "{accepted}");
+        assert_eq!(parse_price(b"10000000"), Some(10_000_000));
+        assert_eq!(parse_price(b"00000250"), Some(250));
+        assert_eq!(parse_price(b"10000001"), None);
+        assert_eq!(parse_price(b"0"), None);
     }
 
     #[test]
