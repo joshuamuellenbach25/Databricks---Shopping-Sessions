@@ -211,16 +211,58 @@ impl Filer {
             self.counts[b] = (n + 1) as u8;
         } else {
             self.counts[b] = 0;
-            self.buckets[b].extend_from_slice(&self.waiting[b]);
+            let bucket = &mut self.buckets[b];
+            if bucket.capacity() - bucket.len() < WAITING {
+                fence();
+                bucket.reserve(WAITING);
+            }
+            stream(&self.waiting[b], bucket);
         }
     }
 
     fn finish(mut self) -> Vec<Vec<Raw>> {
-        for (b, bucket) in self.buckets.iter_mut().enumerate() {
+        fence();
+        let mut buckets = std::mem::take(&mut self.buckets);
+        for (b, bucket) in buckets.iter_mut().enumerate() {
             bucket.extend_from_slice(&self.waiting[b][..usize::from(self.counts[b])]);
         }
-        self.buckets
+        buckets
     }
+}
+
+impl Drop for Filer {
+    fn drop(&mut self) {
+        fence();
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+#[inline(always)]
+fn stream(batch: &[Raw; WAITING], bucket: &mut Vec<Raw>) {
+    use std::arch::x86_64::{__m256i, _mm256_load_si256, _mm256_stream_si256};
+    assert!(bucket.capacity() - bucket.len() >= WAITING);
+    unsafe {
+        let to = bucket.as_mut_ptr().add(bucket.len()).cast::<__m256i>();
+        let from = batch.as_ptr().cast::<__m256i>();
+        for i in 0..WAITING {
+            _mm256_stream_si256(to.add(i), _mm256_load_si256(from.add(i)));
+        }
+        bucket.set_len(bucket.len() + WAITING);
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx")))]
+#[inline(always)]
+fn stream(batch: &[Raw; WAITING], bucket: &mut Vec<Raw>) {
+    bucket.extend_from_slice(batch);
+}
+
+#[inline(always)]
+fn fence() {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+    unsafe {
+        std::arch::x86_64::_mm_sfence()
+    };
 }
 
 pub fn parse(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Result<Parsed> {
