@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 14:33 UTC.
+Updated 2026-11-21 14:43 UTC.
 
 | Item | Value |
 |---|---|
@@ -39,7 +39,7 @@ Updated 2026-11-21 14:33 UTC.
 | opt/dedup3 | CPU work of the events dedup phase (0.570 s of a 2.926 s run at 60M events) on the 0.91 s main, user and kernel time measured apart | 7c4b1fc (events.rs, people.rs); gates pass (56 tests, 36/36, dev MATCH, 6/6); at 60M the dedup phase fell from 489 to 353 ms in fast runs and its user CPU from 3.41 to 2.48 thread-seconds (lower in 12 of 12 paired rounds); no CPU gain at 20M (0.59 s both) or 10M (49 against 48 ms); pinned bench median 1471 ms against 1333 ms, faster in 9 of 15 rounds; Codex review running; ported as opt/cand14; kept as a part for the next combined candidate |
 | opt/cand14 | the 0.85 s main plus the opt/dedup3 change (same patch) | aa7e95f did not compile on the new main (a call to filter_bits as a method); fix 20d9ddd (one line); Codex review: no output defect, the fix re-checked clean; gates pass (69 tests, 36/36, dev MATCH, 6/6); pinned bench median 1461 ms against 1433 ms for the 0.85 s build, faster in 8 of 15 rounds: fails the bench rule (higher median), not submitted |
 | opt/scan3 | user CPU of the events scan (0.629 s of a 1.152 s fast run at 20M events) on the 0.85 s main, user and kernel time measured apart | lane building |
-| opt/tests1 | the opt/sessions4 credit-tie test fix plus a smallest-first tie, tests only, on the 0.85 s main | 84b4777; gates pass (69 tests, 36/36, dev MATCH, 6/6); the credit test now fails all four broken variants of the tie rule; release .text identical to the 0.85 s build; Codex review running |
+| opt/tests1 | the opt/sessions4 credit-tie test fix plus a smallest-first tie, tests only, on the 0.85 s main | 84b4777; gates pass (69 tests, 36/36, dev MATCH, 6/6); the credit test now fails all four broken variants of the tie rule; release .text identical to the 0.85 s build; Codex review: no findings; merged into main (tests only) |
 | opt/cand12 | opt/cand10 plus the opt/sessions4 change (same patch) | ba56144; gates pass (69 tests, 36/36, dev MATCH, 6/6); sessions and output 217 to 139 ms (lower in 12 of 16 rounds); pinned bench median 1644 ms against 1520 ms for the 0.91 s build, faster in 4 of 15 rounds: fails the bench rule, not submitted; 60M output identical, but that run was slow in the events phase (5.054 s against 1.892 s), which cand12 shares with cand10 (1.537 s in its own 60M run) |
 | opt/cand4 | the 1.04 s main plus the opt/directio change, comments stripped | 51d0233; gates pass on Windows (55 tests, 36/36, dev MATCH, 6/6); Codex confirmed 1 item (overlay mounts refuse the read probe; fixed: unknown residency now reads directly), 0 left; the Linux code is not compiled here; needs a port onto the 0.96 s main |
 | opt/cand3 | main plus only the opt/sessions2 change, comments stripped | 0890fe7; gates pass (48 tests, 36/36, dev MATCH, 6/6); reference matched in 228 of 228 runs; Codex confirmed 5 items, none in a single fresh run (reused output folder, failed rerun, per-worker category copy, open file handles, a 2^31 event limit); fix 8643225 (output published only after a whole run, writer text no longer leaked); bench median 1738 ms against 1914 ms, 16 of 25 rounds; scored 0.96 s (receipt BB-FEAC4A51); merged into main |
