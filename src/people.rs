@@ -256,7 +256,7 @@ impl People {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            _mm_prefetch::<_MM_HINT_T0>(self.filter.as_ptr().add(self.filter_bits(key).0) as *const i8);
+            _mm_prefetch::<_MM_HINT_T0>(self.filter.as_ptr().add(filter_bits(key.0, self.filter_mask).0) as *const i8);
         }
         #[cfg(not(target_arch = "x86_64"))]
         let _ = key;
