@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 11:24 UTC.
+Updated 2026-11-21 11:28 UTC.
 
 | Item | Value |
 |---|---|
@@ -29,7 +29,7 @@ Updated 2026-11-21 11:24 UTC.
 | opt/fields2 | events parse and people on the 0.92 s main (53 percent of runtime): field decoding and the linked-ID build | building |
 | opt/cand6 | the 0.96 s main plus the opt/dedup2 change (same patch) | a67654b; gates pass (54 tests, 36/36, dev MATCH, 6/6); Codex review: no output defect, 2 resource limits outside the final's scale (not counted); against the 0.96 s build in the 4 fast-mode rounds of 16: dedup 108 to 55.5 ms, total 662.5 to 604.5 ms; pinned bench median 1174 ms against 1826 ms, faster in 10 of 15 rounds; scored 0.92 s (receipt BB-E8BAC516); merged into main |
 | opt/sessions3 | sessions and output on the 0.96 s solver code (about 21 percent of runtime) | 5e13e45; gates pass (54 tests, 36/36, dev MATCH, 6/6); sessions and output 139 to 97 ms against the 0.96 s build (13 of 16 rounds); about 42 ms of the cut is Windows file work; ported as opt/cand7 |
-| opt/cand7 | the 0.92 s main plus the opt/sessions3 change (same patch) | 7c88fa7; gates pass (36/36, dev MATCH, 6/6); sessions and output 140 to 101 ms against the 0.92 s build (13 of 16 rounds); Codex review: no output defect under scorer conditions; 60M output identical to the 0.92 s build; pinned bench median 1405 ms against 1016 ms, faster in 8 of 15 rounds (fails the lower-median rule); a declared 31-round rerun pooled with those rounds decides the slot |
+| opt/cand7 | the 0.92 s main plus the opt/sessions3 change (same patch) | 7c88fa7; gates pass (36/36, dev MATCH, 6/6); sessions and output 140 to 101 ms against the 0.92 s build (13 of 16 rounds); Codex review: no output defect under scorer conditions; 60M output identical to the 0.92 s build; pinned bench median 1405 ms against 1016 ms, faster in 8 of 15 rounds; a declared 31-round rerun pooled with those rounds gave 1339.5 ms against 1395.5 ms, faster in 24 of 46; submitted 11:28 UTC (receipt BB-E62309C7), scoring |
 | opt/cand4 | the 1.04 s main plus the opt/directio change, comments stripped | 51d0233; gates pass on Windows (55 tests, 36/36, dev MATCH, 6/6); Codex confirmed 1 item (overlay mounts refuse the read probe; fixed: unknown residency now reads directly), 0 left; the Linux code is not compiled here; needs a port onto the 0.96 s main |
 | opt/cand3 | main plus only the opt/sessions2 change, comments stripped | 0890fe7; gates pass (48 tests, 36/36, dev MATCH, 6/6); reference matched in 228 of 228 runs; Codex confirmed 5 items, none in a single fresh run (reused output folder, failed rerun, per-worker category copy, open file handles, a 2^31 event limit); fix 8643225 (output published only after a whole run, writer text no longer leaked); bench median 1738 ms against 1914 ms, 16 of 25 rounds; scored 0.96 s (receipt BB-FEAC4A51); merged into main |
 | opt/nocomments | remove code comments from the shipped files with a parser | superseded: the parse2 merge removed every comment from main (parser check: 0 left) |
