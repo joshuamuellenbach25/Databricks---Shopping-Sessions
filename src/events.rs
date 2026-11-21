@@ -101,13 +101,52 @@ pub struct Context<'a> {
     pub window: Window,
     pub products: &'a Products,
     dates: timestamp::Months,
+    catalog: Catalog,
 }
 
 impl<'a> Context<'a> {
     pub fn new(window: Window, products: &'a Products) -> Context<'a> {
         let first = window.start.div_euclid(DAY) - 1;
         let last = (window.end - 1).div_euclid(DAY) + 6;
-        Context { window, products, dates: timestamp::Months::new(first, last) }
+        Context { window, products, dates: timestamp::Months::new(first, last), catalog: Catalog::new(products) }
+    }
+}
+
+const VACANT: u64 = u64::MAX;
+
+struct Catalog {
+    keys: Vec<u64>,
+    cats: Vec<u16>,
+    bits: u32,
+}
+
+impl Catalog {
+    fn new(products: &Products) -> Catalog {
+        let slots = (2 * products.map.len()).max(16).next_power_of_two();
+        let bits = slots.trailing_zeros();
+        let (mut keys, mut cats) = (vec![VACANT; slots], vec![0; slots]);
+        for (&key, &cat) in &products.map {
+            let mut i = key.bucket(bits);
+            while keys[i] != VACANT {
+                i = (i + 1) & (slots - 1);
+            }
+            keys[i] = key.0;
+            cats[i] = cat;
+        }
+        Catalog { keys, cats, bits }
+    }
+
+    #[inline(always)]
+    fn get(&self, key: Key) -> Option<u16> {
+        let mask = self.keys.len() - 1;
+        let mut i = key.bucket(self.bits);
+        loop {
+            match self.keys[i] {
+                VACANT => return None,
+                k if k == key.0 => return Some(self.cats[i]),
+                _ => i = (i + 1) & mask,
+            }
+        }
     }
 }
 
@@ -169,7 +208,7 @@ fn parse_event(fields: &[&[u8]; 7], ctx: &Context) -> Option<Raw> {
     if purchase && ok {
         match parse_price(fields[6]) {
             Some(price) => {
-                let cat = ctx.products.map.get(&Key::from_bytes(product)).copied().unwrap_or(ctx.products.unknown);
+                let cat = ctx.catalog.get(Key::from_bytes(product)).unwrap_or(ctx.products.unknown);
                 sale = Sale::new(price, cat);
             }
             None => ok = false,
@@ -211,16 +250,67 @@ impl Filer {
             self.counts[b] = (n + 1) as u8;
         } else {
             self.counts[b] = 0;
-            self.buckets[b].extend_from_slice(&self.waiting[b]);
+            stream(&mut self.buckets[b], &self.waiting[b]);
         }
     }
 
     fn finish(mut self) -> Vec<Vec<Raw>> {
+        fence();
         for (b, bucket) in self.buckets.iter_mut().enumerate() {
             bucket.extend_from_slice(&self.waiting[b][..usize::from(self.counts[b])]);
         }
         self.buckets
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn fence() {
+    unsafe { std::arch::x86_64::_mm_sfence() }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn fence() {}
+
+#[cfg(target_arch = "x86_64")]
+struct ExitFence;
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for ExitFence {
+    fn drop(&mut self) {
+        fence();
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+thread_local! {
+    static EXIT_FENCE: ExitFence = const { ExitFence };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn stream(bucket: &mut Vec<Raw>, waiting: &[Raw; WAITING]) {
+    use std::arch::x86_64::*;
+    if bucket.capacity() - bucket.len() < WAITING {
+        fence();
+        bucket.reserve(WAITING);
+    }
+    EXIT_FENCE.with(|_| ());
+    unsafe {
+        let to = bucket.as_mut_ptr().add(bucket.len()) as *mut __m128i;
+        let from = waiting.as_ptr() as *const __m128i;
+        for i in 0..WAITING * std::mem::size_of::<Raw>() / 16 {
+            _mm_stream_si128(to.add(i), _mm_load_si128(from.add(i)));
+        }
+        bucket.set_len(bucket.len() + WAITING);
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn stream(bucket: &mut Vec<Raw>, waiting: &[Raw; WAITING]) {
+    bucket.extend_from_slice(waiting);
 }
 
 pub fn parse(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Result<Parsed> {
@@ -561,6 +651,31 @@ mod tests {
             let copy = raw(&ctx, bad);
             assert!(!copy.ok(), "{bad:?}");
             assert_eq!(copy.event, Key::from_bytes(bad[0].as_bytes()), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn catalog_agrees_with_the_product_map() {
+        let id = |i: usize| match i % 4 {
+            0 => format!("p{i}"),
+            1 => format!("P_{i}"),
+            2 => format!("product_number_{i}"),
+            _ => format!("{i}-p"),
+        };
+        for count in [0, 1, 7, 8, 9, 100, 50_000] {
+            let map: HashMap<Key, u16> = (0..count).map(|i| (Key::from_bytes(id(i).as_bytes()), (i % 21) as u16)).collect();
+            let products = Products { map, categories: Vec::new(), unknown: 21, rank: Vec::new() };
+            let catalog = Catalog::new(&products);
+            assert!(catalog.keys.len() >= 2 * count && catalog.keys.len().is_power_of_two());
+            let mut found = 0;
+            for i in 0..count + 3000 {
+                let key = Key::from_bytes(id(i).as_bytes());
+                let got = catalog.get(key);
+                assert_eq!(got, products.map.get(&key).copied(), "{count} products, {}", id(i));
+                found += usize::from(got.is_some());
+            }
+            assert_eq!(found, count);
+            assert_eq!(catalog.get(Key::from_bytes(b"")), None);
         }
     }
 
