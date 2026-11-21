@@ -39,9 +39,31 @@ where
     W: Fn(&mut S, &[u8], usize, usize) + Sync,
 {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    if let Some(states) = crate::direct::try_cold(&crate::direct::Linux, paths, threads, chunk, crate::direct::BUFFER, &init, &work) {
-        return Ok(states);
+    return run_tasks_on(&crate::direct::Linux, crate::direct::BUFFER, paths, threads, chunk, init, work);
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    run_maps(paths, threads, chunk, init, work)
+}
+
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+fn run_tasks_on<D, S, I, W>(disk: &D, buffer: usize, paths: &[PathBuf], threads: usize, chunk: usize, init: I, work: W) -> io::Result<Vec<S>>
+where
+    D: crate::direct::Disk,
+    S: Send,
+    I: Fn() -> S + Sync,
+    W: Fn(&mut S, &[u8], usize, usize) + Sync,
+{
+    match crate::direct::try_cold(disk, paths, threads, chunk, buffer, &init, &work) {
+        Some(states) => Ok(states),
+        None => run_maps(paths, threads, chunk, init, work),
     }
+}
+
+fn run_maps<S, I, W>(paths: &[PathBuf], threads: usize, chunk: usize, init: I, work: W) -> io::Result<Vec<S>>
+where
+    S: Send,
+    I: Fn() -> S + Sync,
+    W: Fn(&mut S, &[u8], usize, usize) + Sync,
+{
     let clock = std::time::Instant::now();
     let mut maps = Vec::with_capacity(paths.len());
     for path in paths {
@@ -322,6 +344,7 @@ fn fields<'a, const N: usize, S>(data: &'a [u8], start: usize, end: usize, state
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::Key;
     use std::io::Write;
     use std::mem::MaybeUninit;
 
@@ -708,6 +731,8 @@ mod tests {
 
     struct Fake {
         warm: Vec<PathBuf>,
+        masked: bool,
+        refuse_probe: bool,
         step: usize,
         fail_at: Option<u64>,
         end_at: Option<u64>,
@@ -716,7 +741,7 @@ mod tests {
 
     impl Fake {
         fn cold(step: usize) -> Fake {
-            Fake { warm: Vec::new(), step, fail_at: None, end_at: None, refuse_open: false }
+            Fake { warm: Vec::new(), masked: false, refuse_probe: false, step, fail_at: None, end_at: None, refuse_open: false }
         }
     }
 
@@ -724,8 +749,15 @@ mod tests {
         type File = Vec<u8>;
 
         fn incore(&self, path: &Path, _: &[u8], pages: &mut [u8]) -> io::Result<()> {
-            pages.fill(u8::from(self.warm.iter().any(|warm| warm == path)));
+            pages.fill(u8::from(self.masked || self.warm.iter().any(|warm| warm == path)));
             Ok(())
+        }
+
+        fn cached(&self, path: &Path, _: &File, offset: u64) -> io::Result<bool> {
+            if self.refuse_probe {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, format!("no read probe at offset {offset}")));
+            }
+            Ok(self.warm.iter().any(|warm| warm == path))
         }
 
         fn open(&self, path: &Path) -> io::Result<Vec<u8>> {
@@ -789,12 +821,14 @@ mod tests {
             for step in [4096, 8192, usize::MAX] {
                 for threads in [1, 3] {
                     for warm in [Vec::new(), every_other.clone()] {
-                        let label = format!("buffer {buffer}, step {step}, threads {threads}, {} warm", warm.len());
-                        let fake = Fake { warm, ..Fake::cold(step) };
-                        let states = crate::direct::try_cold(&fake, &paths, threads, 100, buffer, &Vec::new, &push_fields::<4>).unwrap_or_else(|| panic!("{label}: no cold read"));
-                        assert_eq!(states.len(), threads, "{label}");
-                        let got = rows_of(states);
-                        assert!(got == want, "{label}: {} rows, want {}", got.len(), want.len());
+                        for masked in [false, true] {
+                            let label = format!("buffer {buffer}, step {step}, threads {threads}, {} warm, masked {masked}", warm.len());
+                            let fake = Fake { warm: warm.clone(), masked, ..Fake::cold(step) };
+                            let states = crate::direct::try_cold(&fake, &paths, threads, 100, buffer, &Vec::new, &push_fields::<4>).unwrap_or_else(|| panic!("{label}: no cold read"));
+                            assert_eq!(states.len(), threads, "{label}");
+                            let got = rows_of(states);
+                            assert!(got == want, "{label}: {} rows, want {}", got.len(), want.len());
+                        }
                     }
                 }
             }
@@ -807,6 +841,8 @@ mod tests {
         let paths = cold_files(&dir);
         let cases = [
             ("every file warm", Fake { warm: paths.clone(), ..Fake::cold(usize::MAX) }),
+            ("every file warm behind a masked report", Fake { warm: paths.clone(), masked: true, ..Fake::cold(usize::MAX) }),
+            ("a read probe refused", Fake { masked: true, refuse_probe: true, ..Fake::cold(usize::MAX) }),
             ("a read error", Fake { fail_at: Some(4096), ..Fake::cold(usize::MAX) }),
             ("a file shorter than its size", Fake { end_at: Some(4096), ..Fake::cold(usize::MAX) }),
             ("an unaligned short read", Fake::cold(1000)),
@@ -829,5 +865,78 @@ mod tests {
         assert!(crate::direct::try_cold(&Fake::cold(usize::MAX), &paths, 2, 100, 4096, &Vec::new, &push_fields::<4>).is_none(), "4096-byte reads");
         let states = crate::direct::try_cold(&Fake::cold(usize::MAX), &paths, 2, 100, 8 * 4096, &Vec::new, &push_fields::<4>).expect("32768-byte reads");
         assert!(rows_of(states) == want);
+    }
+
+    struct Late<'a> {
+        fail_at: u64,
+        rows: &'a AtomicUsize,
+        before: &'a AtomicUsize,
+    }
+
+    unsafe impl crate::direct::Disk for Late<'_> {
+        type File = Vec<u8>;
+
+        fn incore(&self, _: &Path, _: &[u8], pages: &mut [u8]) -> io::Result<()> {
+            pages.fill(0);
+            Ok(())
+        }
+
+        fn cached(&self, path: &Path, _: &File, offset: u64) -> io::Result<bool> {
+            Err(io::Error::other(format!("{} is not probed at offset {offset} here", path.display())))
+        }
+
+        fn open(&self, path: &Path) -> io::Result<Vec<u8>> {
+            std::fs::read(path)
+        }
+
+        fn read_at(&self, file: &Vec<u8>, dst: &mut [MaybeUninit<u8>], offset: u64) -> io::Result<usize> {
+            if offset == self.fail_at {
+                let clock = std::time::Instant::now();
+                while self.rows.load(Ordering::SeqCst) == 0 && clock.elapsed() < std::time::Duration::from_secs(30) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                self.before.fetch_max(self.rows.load(Ordering::SeqCst), Ordering::SeqCst);
+                return Err(io::Error::other(format!("no read at offset {offset}")));
+            }
+            let start = file.len().min(offset as usize);
+            let n = dst.len().min(file.len() - start);
+            for (slot, &byte) in dst.iter_mut().zip(&file[start..start + n]) {
+                slot.write(byte);
+            }
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_late_failure_falls_back_to_the_rows_of_the_maps() {
+        let dir = temp_dir("late");
+        let mut text = b"user_id_a,user_id_b\n".to_vec();
+        for i in 0..2000 {
+            text.extend_from_slice(format!("late-left-{i:06},\"late-right-{:06}\"\n", i * 7919 % 2003).as_bytes());
+        }
+        for (f, cut) in [0, 4097, 9000].into_iter().enumerate() {
+            std::fs::write(dir.join(format!("part-{f}.csv")), &text[..text.len() - cut]).unwrap();
+        }
+        let paths = csv_files(&dir).unwrap();
+        let mut want: Vec<(Vec<u8>, Vec<u8>)> = paths.iter().flat_map(|path| expected::<2>(&std::fs::read(path).unwrap())).map(|row| (row[0].clone(), row[1].clone())).collect();
+        want.sort();
+        let rows = AtomicUsize::new(0);
+        let before = AtomicUsize::new(0);
+        let work = |state: &mut Vec<(Key, Key)>, data: &[u8], start: usize, end: usize| {
+            fields::<2, _>(data, start, end, state, &|state: &mut Vec<(Key, Key)>, f: &[&[u8]; 2]| {
+                rows.fetch_add(1, Ordering::SeqCst);
+                state.push((Key::from_bytes(f[0]), Key::from_bytes(f[1])));
+            })
+        };
+        let bytes = |states: Vec<Vec<(Key, Key)>>| {
+            let mut all: Vec<(Vec<u8>, Vec<u8>)> = states.into_iter().flatten().map(|(a, b)| (a.to_vec(), b.to_vec())).collect();
+            all.sort();
+            all
+        };
+        let late = Late { fail_at: 3 * 4096, rows: &rows, before: &before };
+        let replayed = bytes(run_tasks_on(&late, 4096, &paths, 3, 100, Vec::new, &work).unwrap());
+        assert!(before.load(Ordering::SeqCst) > 0, "no row was parsed before the failure");
+        let mapped = bytes(run_maps(&paths, 3, 100, Vec::new, &work).unwrap());
+        assert!(want.len() > 5000 && replayed == want && mapped == want, "{} rows after the failure, {} from the maps, want {}", replayed.len(), mapped.len(), want.len());
     }
 }
