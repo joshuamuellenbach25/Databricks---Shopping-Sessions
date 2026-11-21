@@ -2,9 +2,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use hashbrown::hash_map::Entry;
-use hashbrown::HashMap;
-
 use crate::ids::Key;
 use crate::lookups::{Products, Window};
 use crate::people::People;
@@ -227,6 +224,123 @@ pub fn parse(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Resul
     Ok(states.into_iter().map(Filer::finish).collect())
 }
 
+const SEEN_MIX: u64 = 0xA076_1D64_78BD_642F;
+const COPY_MIX: u64 = 0xE703_7ED1_A0B4_28DB;
+const SEEN_BITS_PER_RECORD: usize = 8;
+
+fn grow<T: Clone>(buffer: &mut Vec<T>, len: usize, fill: T) {
+    if buffer.len() < len {
+        buffer.resize(len, fill);
+    }
+}
+
+#[inline(always)]
+fn seen_bit(event: Key, shift: u32) -> (usize, u64) {
+    let h = (event.0.wrapping_mul(SEEN_MIX) >> shift) as usize;
+    (h >> 6, 1 << (h & 63))
+}
+
+struct Sieve {
+    once: Vec<u64>,
+    twice: Vec<u64>,
+    copies: Vec<(u32, u32)>,
+    keys: Vec<u64>,
+    kept: Vec<(u32, u32)>,
+    survivors: Vec<Event>,
+    linked: Vec<u32>,
+}
+
+impl Sieve {
+    fn new() -> Sieve {
+        Sieve { once: Vec::new(), twice: Vec::new(), copies: Vec::new(), keys: Vec::new(), kept: Vec::new(), survivors: Vec::new(), linked: Vec::new() }
+    }
+
+    fn survivors(&mut self, parts: &mut [Vec<Raw>], people: &People) -> &[Event] {
+        let total: usize = parts.iter().map(Vec::len).sum();
+        assert!(u32::try_from(total).is_ok(), "an event bucket holds {total} records; at most 2^32 - 1 fit");
+        let bits = (total * SEEN_BITS_PER_RECORD).max(64).next_power_of_two().trailing_zeros();
+        let (words, shift) = (1usize << (bits - 6), 64 - bits);
+        grow(&mut self.once, words, 0);
+        grow(&mut self.twice, words, 0);
+        let (once, twice) = (&mut self.once[..words], &mut self.twice[..words]);
+        once.fill(0);
+        twice.fill(0);
+        for raw in parts.iter().flatten() {
+            let (w, b) = seen_bit(raw.event, shift);
+            twice[w] |= once[w] & b;
+            once[w] |= b;
+        }
+        grow(&mut self.survivors, total, Event { person: NO_USER, ts: 0, sale: Sale::NONE });
+        grow(&mut self.linked, total, 0);
+        grow(&mut self.copies, total, (0, 0));
+        let (mut n, mut m, mut c) = (0, 0, 0);
+        for (s, part) in parts.iter().enumerate() {
+            for (p, raw) in part.iter().enumerate() {
+                let (w, b) = seen_bit(raw.event, shift);
+                let copied = twice[w] & b != 0;
+                let keep = raw.ok() & !copied;
+                self.survivors[n] = Event { person: raw.user, ts: raw.ts, sale: raw.sale };
+                self.linked[m] = n as u32;
+                self.copies[c] = (s as u32, p as u32);
+                m += usize::from(keep & people.may_be_linked(raw.user));
+                n += usize::from(keep);
+                c += usize::from(copied);
+            }
+        }
+        self.keep_earliest(parts, c);
+        for &(s, p) in &self.copies[..c] {
+            let raw = &parts[s as usize][p as usize];
+            if raw.ok() {
+                self.survivors[n] = Event { person: raw.user, ts: raw.ts, sale: raw.sale };
+                self.linked[m] = n as u32;
+                m += usize::from(people.may_be_linked(raw.user));
+                n += 1;
+            }
+        }
+        for t in 0..m {
+            if let Some(&ahead) = self.linked[..m].get(t + PREFETCH_AHEAD) {
+                people.prefetch_slot(self.survivors[ahead as usize].person);
+            }
+            let j = self.linked[t] as usize;
+            self.survivors[j].person = people.linked_name(self.survivors[j].person);
+        }
+        &self.survivors[..n]
+    }
+
+    fn keep_earliest(&mut self, parts: &mut [Vec<Raw>], count: usize) {
+        let bits = (count * 2).max(16).next_power_of_two().trailing_zeros();
+        let size = 1usize << bits;
+        grow(&mut self.keys, size, 0);
+        grow(&mut self.kept, size, (0, 0));
+        let keys = &mut self.keys[..size];
+        keys.fill(0);
+        let (mask, shift) = (size - 1, 64 - bits);
+        for &(s, p) in &self.copies[..count] {
+            let (s, p) = (s as usize, p as usize);
+            let (event, ingest) = (parts[s][p].event, parts[s][p].ingest);
+            let mut i = (event.0.wrapping_mul(COPY_MIX) >> shift) as usize;
+            loop {
+                if keys[i] == 0 {
+                    keys[i] = event.0;
+                    self.kept[i] = (s as u32, p as u32);
+                    break;
+                }
+                if keys[i] == event.0 {
+                    let (hs, hp) = (self.kept[i].0 as usize, self.kept[i].1 as usize);
+                    if ingest < parts[hs][hp].ingest {
+                        parts[hs][hp].user = NO_USER;
+                        self.kept[i] = (s as u32, p as u32);
+                    } else {
+                        parts[s][p].user = NO_USER;
+                    }
+                    break;
+                }
+                i = (i + 1) & mask;
+            }
+        }
+    }
+}
+
 pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> {
     const CHUNKS_PER_PART: usize = 8;
     const MIN_CHUNK: usize = 64;
@@ -246,40 +360,15 @@ pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> 
                 scope.spawn(|| {
                     let mut open: Vec<Vec<Event>> = (0..PERSON_BUCKETS).map(|_| Vec::new()).collect();
                     let mut full: Vec<Vec<Vec<Event>>> = (0..PERSON_BUCKETS).map(|_| Vec::new()).collect();
-                    let mut kept: HashMap<Key, (i64, u32, u32)> = HashMap::new();
-                    let mut survivors: Vec<(u32, u32)> = Vec::new();
+                    let mut sieve = Sieve::new();
                     loop {
                         let b = next.fetch_add(1, Ordering::Relaxed);
                         if b >= EVENT_BUCKETS {
                             break;
                         }
-                        let parts = std::mem::take(&mut *by_bucket[b].lock().unwrap());
-                        let total: usize = parts.iter().map(Vec::len).sum();
-                        kept.clear();
-                        kept.reserve(total);
-                        for (s, part) in parts.iter().enumerate() {
-                            for (p, raw) in part.iter().enumerate() {
-                                match kept.entry(raw.event) {
-                                    Entry::Vacant(v) => {
-                                        v.insert((raw.ingest, s as u32, p as u32));
-                                    }
-                                    Entry::Occupied(mut o) => {
-                                        if raw.ingest < o.get().0 {
-                                            o.insert((raw.ingest, s as u32, p as u32));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        survivors.clear();
-                        survivors.extend(kept.values().map(|&(_, s, p)| (s, p)).filter(|&(s, p)| parts[s as usize][p as usize].ok()));
-                        for (i, &(s, p)) in survivors.iter().enumerate() {
-                            if let Some(&(s_ahead, p_ahead)) = survivors.get(i + PREFETCH_AHEAD) {
-                                people.prefetch(parts[s_ahead as usize][p_ahead as usize].user);
-                            }
-                            let raw = &parts[s as usize][p as usize];
-                            let person = people.name_of(raw.user);
-                            let bucket = person.bucket(PERSON_BITS);
+                        let mut parts = std::mem::take(&mut *by_bucket[b].lock().unwrap());
+                        for event in sieve.survivors(&mut parts, people) {
+                            let bucket = event.person.bucket(PERSON_BITS);
                             let current = &mut open[bucket];
                             if current.len() == current.capacity() {
                                 let filled = std::mem::replace(current, Vec::with_capacity(chunk));
@@ -287,7 +376,7 @@ pub fn dedup(parsed: Parsed, threads: usize, people: &People) -> Buckets<Event> 
                                     full[bucket].push(filled);
                                 }
                             }
-                            current.push(Event { person, ts: raw.ts, sale: raw.sale });
+                            current.push(*event);
                         }
                     }
                     for (bucket, current) in open.into_iter().enumerate() {
@@ -327,6 +416,7 @@ pub fn transpose<T>(per_thread: Vec<Vec<Vec<T>>>) -> Buckets<T> {
 mod tests {
     use super::*;
     use crate::timestamp::HOUR;
+    use hashbrown::HashMap;
 
     fn at(text: &str) -> i64 {
         timestamp::parse(text.as_bytes()).unwrap()
@@ -505,6 +595,7 @@ mod tests {
 #[cfg(test)]
 mod dedup_tests {
     use super::*;
+    use hashbrown::HashMap;
 
     fn key(text: &str) -> Key {
         Key::from_bytes(text.as_bytes())
@@ -595,5 +686,19 @@ mod dedup_tests {
         let got = dedup(Vec::new(), 2, &people);
         assert_eq!(got.len(), PERSON_BUCKETS);
         assert!(got.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn three_copies_keep_the_smallest_ingest_in_any_order() {
+        let people = People::build(Vec::new(), 0);
+        let copies = [10, 20, 30].map(|ingest| Raw { event: key("e1"), ingest, user: key(&format!("u{ingest}")), ts: ingest as i32, sale: Sale::NONE });
+        let first_invalid = [Raw { user: NO_USER, ..copies[0] }, copies[1], copies[2]];
+        for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            for (group, want) in [(copies, vec![10]), (first_invalid, vec![])] {
+                let raws: Vec<Raw> = order.iter().map(|&i| group[i]).collect();
+                let got: Vec<i32> = dedup(parsed(&raws, 3), 2, &people).iter().flatten().flatten().map(|e| e.ts).collect();
+                assert_eq!(got, want, "order {order:?}");
+            }
+        }
     }
 }
