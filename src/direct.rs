@@ -48,6 +48,12 @@ const RWF_NOWAIT: std::ffi::c_long = 8;
 const EAGAIN: i32 = 11;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const ENOSYS: i32 = 38;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const EOPNOTSUPP: i32 = 95;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub struct Linux;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -82,6 +88,7 @@ unsafe impl Disk for Linux {
             0 => Ok(false),
             -1 => match io::Error::last_os_error() {
                 error if error.raw_os_error() == Some(EAGAIN) => Ok(false),
+                error if error.raw_os_error() == Some(EOPNOTSUPP) || error.raw_os_error() == Some(ENOSYS) => Err(io::Error::new(io::ErrorKind::Unsupported, format!("a read probe without waiting at offset {offset}: {error}"))),
                 error => Err(error),
             },
             other => Err(io::Error::other(format!("a 1-byte read probe at offset {offset} reported {other}"))),
@@ -278,7 +285,7 @@ fn samples(pages: usize) -> impl Iterator<Item = usize> {
     (0..count).map(move |i| if count > 1 { i * last / (count - 1) } else { 0 })
 }
 
-fn mostly_resident<D: Disk>(disk: &D, path: &Path, map: &[u8], mut probe: impl FnMut(u64) -> io::Result<bool>) -> io::Result<bool> {
+fn mostly_resident<D: Disk>(disk: &D, path: &Path, map: &[u8], mut probe: impl FnMut(u64) -> io::Result<bool>) -> io::Result<Option<bool>> {
     let total = map.len().div_ceil(PAGE);
     let mut pages = [0u8; WINDOW];
     let (mut seen, mut resident, mut next) = (0, 0, 0);
@@ -297,16 +304,23 @@ fn mostly_resident<D: Disk>(disk: &D, path: &Path, map: &[u8], mut probe: impl F
         next = to;
     }
     if resident < seen {
-        return Ok(2 * resident > seen);
+        return Ok(Some(2 * resident > seen));
     }
     let mut cached = 0;
     for (probed, &from) in starts.iter().enumerate() {
         if 2 * cached > starts.len() || 2 * (probed - cached) >= starts.len() {
             break;
         }
-        cached += usize::from(probe((from * PAGE) as u64)?);
+        let hit = loop {
+            match probe((from * PAGE) as u64) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => return Ok(None),
+                hit => break hit?,
+            }
+        };
+        cached += usize::from(hit);
     }
-    Ok(2 * cached > starts.len())
+    Ok(Some(2 * cached > starts.len()))
 }
 
 struct Cold<'a, F> {
@@ -348,6 +362,7 @@ where
     let named = |path: &Path, e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", path.display()));
     let mut warm = Vec::new();
     let mut cold = Vec::new();
+    let mut unknown = 0;
     for path in paths {
         let file = File::open(path).map_err(|e| named(path, e))?;
         let size = file.metadata().map_err(|e| named(path, e))?.len();
@@ -355,9 +370,11 @@ where
             continue;
         }
         let map = unsafe { MmapOptions::new().map(&file) }.map_err(|e| named(path, e))?;
-        if mostly_resident(disk, path, &map, |offset| disk.cached(path, &file, offset)).map_err(|e| named(path, e))? {
+        let residency = mostly_resident(disk, path, &map, |offset| disk.cached(path, &file, offset)).map_err(|e| named(path, e))?;
+        if residency == Some(true) {
             warm.push(map);
         } else {
+            unknown += usize::from(residency.is_none());
             let file = disk.open(path).map_err(|e| named(path, e))?;
             cold.push(Cold { path: path.as_path(), file, size });
         }
@@ -370,7 +387,7 @@ where
     let states = read_all(disk, &cold, &maps, chunk, buffer, threads, init, work)?;
     drop(maps);
     std::mem::forget(warm);
-    eprintln!("  scan: {} files, {} read with O_DIRECT, map {:.3} s, parse {:.3} s", paths.len(), cold.len(), mapped.as_secs_f64(), (clock.elapsed() - mapped).as_secs_f64());
+    eprintln!("  scan: {} files, {} read with O_DIRECT ({} of unknown residency), map {:.3} s, parse {:.3} s", paths.len(), cold.len(), unknown, mapped.as_secs_f64(), (clock.elapsed() - mapped).as_secs_f64());
     Ok(Some(states))
 }
 
@@ -621,14 +638,14 @@ mod tests {
     fn residency_counts_each_sampled_page_once() {
         let mut ends = vec![false; WINDOW + 1];
         ends[..8].fill(true);
-        assert!(!mostly_resident(&Marked, Path::new("ends.csv"), &marked(&ends), unprobed).unwrap());
+        assert_eq!(mostly_resident(&Marked, Path::new("ends.csv"), &marked(&ends), unprobed).unwrap(), Some(false));
         ends[WINDOW] = true;
-        assert!(mostly_resident(&Marked, Path::new("ends.csv"), &marked(&ends), unprobed).unwrap());
+        assert_eq!(mostly_resident(&Marked, Path::new("ends.csv"), &marked(&ends), unprobed).unwrap(), Some(true));
         let pages = 1000;
         for (resident, want) in [(0, false), (400, false), (600, true), (pages, true)] {
             let map = marked(&(0..pages).map(|page| page < resident).collect::<Vec<_>>());
             let probe = |offset: u64| if resident < pages { unprobed(offset) } else { Ok(map[offset as usize] == b'r') };
-            assert_eq!(mostly_resident(&Marked, Path::new("big.csv"), &map, probe).unwrap(), want, "{resident} of {pages} pages resident");
+            assert_eq!(mostly_resident(&Marked, Path::new("big.csv"), &map, probe).unwrap(), Some(want), "{resident} of {pages} pages resident");
         }
     }
 
@@ -642,12 +659,41 @@ mod tests {
                 probes += 1;
                 Ok(map[offset as usize] == b'r')
             };
-            assert_eq!(mostly_resident(&Masked, Path::new("masked.csv"), &map, probe).unwrap(), want, "{cached} of {pages} pages cached");
+            assert_eq!(mostly_resident(&Masked, Path::new("masked.csv"), &map, probe).unwrap(), Some(want), "{cached} of {pages} pages cached");
             assert_eq!(probes, expect, "{cached} of {pages} pages cached");
         }
         let map = marked(&[true; 3]);
         assert!(mostly_resident(&Masked, Path::new("small.csv"), &map, unprobed).is_err());
-        assert!(!mostly_resident(&Masked, Path::new("small.csv"), &map, |_| Ok(false)).unwrap());
+        assert_eq!(mostly_resident(&Masked, Path::new("small.csv"), &map, |_| Ok(false)).unwrap(), Some(false));
+    }
+
+    #[test]
+    fn an_unsupported_probe_leaves_residency_unknown_and_an_interrupted_probe_is_retried() {
+        let pages = 1000;
+        for cached in [0, pages] {
+            let map = marked(&(0..pages).map(|page| page < cached).collect::<Vec<_>>());
+            let mut probes = 0;
+            let unsupported = |offset: u64| {
+                probes += 1;
+                Err(io::Error::new(io::ErrorKind::Unsupported, format!("no read probe without waiting at offset {offset}")))
+            };
+            assert_eq!(mostly_resident(&Masked, Path::new("unsupported.csv"), &map, unsupported).unwrap(), None, "{cached} of {pages} pages cached");
+            assert_eq!(probes, 1, "{cached} of {pages} pages cached");
+        }
+        for (cached, want, expect) in [(0, false, 8), (400, false, 15), (600, true, 9), (pages, true, 9)] {
+            let map = marked(&(0..pages).map(|page| page < cached).collect::<Vec<_>>());
+            let (mut calls, mut last) = (0, None);
+            let interrupted = |offset: u64| {
+                calls += 1;
+                if last != Some(offset) {
+                    last = Some(offset);
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                Ok(map[offset as usize] == b'r')
+            };
+            assert_eq!(mostly_resident(&Masked, Path::new("interrupted.csv"), &map, interrupted).unwrap(), Some(want), "{cached} of {pages} pages cached");
+            assert_eq!(calls, 2 * expect, "{cached} of {pages} pages cached");
+        }
     }
 
     #[test]

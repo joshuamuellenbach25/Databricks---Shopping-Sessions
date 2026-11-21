@@ -694,7 +694,7 @@ mod tests {
     struct Fake {
         warm: Vec<PathBuf>,
         masked: bool,
-        refuse_probe: bool,
+        probe_error: Option<io::ErrorKind>,
         step: usize,
         fail_at: Option<u64>,
         end_at: Option<u64>,
@@ -703,7 +703,7 @@ mod tests {
 
     impl Fake {
         fn cold(step: usize) -> Fake {
-            Fake { warm: Vec::new(), masked: false, refuse_probe: false, step, fail_at: None, end_at: None, refuse_open: false }
+            Fake { warm: Vec::new(), masked: false, probe_error: None, step, fail_at: None, end_at: None, refuse_open: false }
         }
     }
 
@@ -716,8 +716,8 @@ mod tests {
         }
 
         fn cached(&self, path: &Path, _: &File, offset: u64) -> io::Result<bool> {
-            if self.refuse_probe {
-                return Err(io::Error::new(io::ErrorKind::Unsupported, format!("no read probe at offset {offset}")));
+            if let Some(kind) = self.probe_error {
+                return Err(io::Error::new(kind, format!("no read probe at offset {offset}")));
             }
             Ok(self.warm.iter().any(|warm| warm == path))
         }
@@ -804,7 +804,7 @@ mod tests {
         let cases = [
             ("every file warm", Fake { warm: paths.clone(), ..Fake::cold(usize::MAX) }),
             ("every file warm behind a masked report", Fake { warm: paths.clone(), masked: true, ..Fake::cold(usize::MAX) }),
-            ("a read probe refused", Fake { masked: true, refuse_probe: true, ..Fake::cold(usize::MAX) }),
+            ("a read probe failed", Fake { masked: true, probe_error: Some(io::ErrorKind::Other), ..Fake::cold(usize::MAX) }),
             ("a read error", Fake { fail_at: Some(4096), ..Fake::cold(usize::MAX) }),
             ("a file shorter than its size", Fake { end_at: Some(4096), ..Fake::cold(usize::MAX) }),
             ("an unaligned short read", Fake::cold(1000)),
@@ -818,11 +818,28 @@ mod tests {
     }
 
     #[test]
+    fn an_unsupported_read_probe_still_reads_directly() {
+        let dir = temp_dir("unknown");
+        let paths = cold_files(&dir);
+        let want = rows_of(run_maps(&paths, 2, 100, Vec::new, push_fields::<4>).unwrap());
+        let every_other: Vec<PathBuf> = paths.iter().step_by(2).cloned().collect();
+        for threads in [1, 3] {
+            for warm in [Vec::new(), every_other.clone()] {
+                let label = format!("threads {threads}, {} warm", warm.len());
+                let fake = Fake { warm, masked: true, probe_error: Some(io::ErrorKind::Unsupported), ..Fake::cold(usize::MAX) };
+                let states = crate::direct::try_cold(&fake, &paths, threads, 100, 4096, &Vec::new, &push_fields::<4>).unwrap_or_else(|| panic!("{label}: no direct read"));
+                let got = rows_of(states);
+                assert!(got == want, "{label}: {} rows, want {}", got.len(), want.len());
+            }
+        }
+    }
+
+    #[test]
     fn cold_reads_refuse_edges_past_their_budget() {
         let dir = temp_dir("budget");
         std::fs::write(dir.join("part-wide.csv"), [b"h\n".as_slice(), &[b'x'; 100_000], b",y,z,w\n"].concat()).unwrap();
         let paths = cold_files(&dir);
-        let want = rows_of(run_fields::<4, _, _, _>(&paths, 2, 100, Vec::new, |s: &mut Rows, f| s.push(f.iter().map(|v| v.to_vec()).collect())).unwrap());
+        let want = rows_of(run_maps(&paths, 2, 100, Vec::new, push_fields::<4>).unwrap());
         assert!(want.iter().any(|row| row[0].len() == 100_000));
         assert!(crate::direct::try_cold(&Fake::cold(usize::MAX), &paths, 2, 100, 4096, &Vec::new, &push_fields::<4>).is_none(), "4096-byte reads");
         let states = crate::direct::try_cold(&Fake::cold(usize::MAX), &paths, 2, 100, 8 * 4096, &Vec::new, &push_fields::<4>).expect("32768-byte reads");
