@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 13:08 UTC.
+Updated 2026-11-21 13:13 UTC.
 
 | Item | Value |
 |---|---|
@@ -35,6 +35,7 @@ Updated 2026-11-21 13:08 UTC.
 | opt/sessions4 | CPU work of the sessions and output phase on the 0.92 s main, file handling unchanged | a39a60a (sessions.rs only); lane Codex review running; ported as opt/cand11 |
 | opt/cand10 | the 0.91 s main plus the opt/parse4 tokenizer and the opt/fields2 person build | deae350; gates pass (68 tests, 36/36, dev MATCH, 6/6); pinned bench median 1669 ms against 1680 ms for the 0.91 s build, faster in 8 of 15 rounds; fast-mode rounds about equal at 10M events; 60M output identical, time to the end of the last phase 2.926 s against 4.712 s, person build 0.713 s against 2.595 s; Codex review: no output defect, one memory note (the link pairs stay alive after the person build, about 40 MiB at 60M, while the measured 60M peak stays below main's: 8.17 GiB against 8.29 GiB) and two limits outside the final's scale; ready for the next submission slot |
 | opt/cand11 | the 0.91 s main plus the opt/sessions4 change (same patch) | ba252b8; gates pass (57 tests, 36/36, dev MATCH, 6/6); sessions and output 324 to 254 ms (lower in 14 of 16 rounds); pinned bench median 1427 ms against 1547 ms for the 0.91 s build, faster in 11 of 15 rounds; file creates and renames unchanged; 60M output identical, sessions and output 0.547 s against 0.591 s, clicks 0.287 s against 0.270 s; Codex review of the same patch running |
+| opt/dedup3 | CPU work of the events dedup phase (0.570 s of a 2.926 s run at 60M events) on the 0.91 s main, user and kernel time measured apart | lane building |
 | opt/cand12 | opt/cand10 plus the opt/sessions4 change (same patch) | ba56144; gates pass (69 tests, 36/36, dev MATCH, 6/6); sessions and output 217 to 139 ms (lower in 12 of 16 rounds); pinned bench median 1644 ms against 1520 ms for the 0.91 s build, faster in 4 of 15 rounds: fails the bench rule, not submitted; 60M output identical, but that run was slow in the events phase (5.054 s against 1.892 s), which cand12 shares with cand10 (1.537 s in its own 60M run) |
 | opt/cand4 | the 1.04 s main plus the opt/directio change, comments stripped | 51d0233; gates pass on Windows (55 tests, 36/36, dev MATCH, 6/6); Codex confirmed 1 item (overlay mounts refuse the read probe; fixed: unknown residency now reads directly), 0 left; the Linux code is not compiled here; needs a port onto the 0.96 s main |
 | opt/cand3 | main plus only the opt/sessions2 change, comments stripped | 0890fe7; gates pass (48 tests, 36/36, dev MATCH, 6/6); reference matched in 228 of 228 runs; Codex confirmed 5 items, none in a single fresh run (reused output folder, failed rerun, per-worker category copy, open file handles, a 2^31 event limit); fix 8643225 (output published only after a whole run, writer text no longer leaked); bench median 1738 ms against 1914 ms, 16 of 25 rounds; scored 0.96 s (receipt BB-FEAC4A51); merged into main |
