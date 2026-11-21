@@ -1,14 +1,14 @@
 # Status
 
-Updated 2026-11-21 13:13 UTC.
+Updated 2026-11-21 13:20 UTC.
 
 | Item | Value |
 |---|---|
-| Best practice score | 0.91 s (commit 919c060, faster event decoding and filing; entered in the final) |
+| Best practice score | 0.90 s (commit deae350, block tokenizer and person table built in parts; entered in the final) |
 | Final-scale check | a67654b on 60M generated events: exit 0, peak working set 8.41 GiB, both tables identical to the 0.96 s build's output |
 | Board leader | 0.31 s |
 | Target (leader minus 10 percent) | 0.279 s |
-| Main | solver code of 919c060 (parse stage redesign, the sessions and output rewrite, the faster dedup and click filing, and the faster event decoding and filing, no code comments); the opt/memexit changes are not in it, since they scored the same 1.04 s |
+| Main | solver code of deae350 (parse stage redesign, the sessions and output rewrite, the faster dedup and click filing, the faster event decoding and filing, the block tokenizer and the person table built in parts, no code comments); the opt/memexit changes are not in it, since they scored the same 1.04 s |
 
 ## Work in progress
 
@@ -33,7 +33,7 @@ Updated 2026-11-21 13:13 UTC.
 | opt/sessions3 | sessions and output on the 0.96 s solver code (about 21 percent of runtime) | 5e13e45; gates pass (54 tests, 36/36, dev MATCH, 6/6); sessions and output 139 to 97 ms against the 0.96 s build (13 of 16 rounds); about 42 ms of the cut is Windows file work; ported as opt/cand7; lane stopped |
 | opt/cand7 | the 0.92 s main plus the opt/sessions3 change (same patch) | 7c88fa7; gates pass (36/36, dev MATCH, 6/6); sessions and output 140 to 101 ms against the 0.92 s build (13 of 16 rounds); Codex review: no output defect under scorer conditions; 60M output identical to the 0.92 s build; pinned bench median 1405 ms against 1016 ms, faster in 8 of 15 rounds; a declared 31-round rerun pooled with those rounds gave 1339.5 ms against 1395.5 ms, faster in 24 of 46; scored 0.95 s (receipt BB-E62309C7), worse than 0.92 s: about 42 ms of its local cut was Windows file work that the Linux scorer does not pay; not merged |
 | opt/sessions4 | CPU work of the sessions and output phase on the 0.92 s main, file handling unchanged | a39a60a (sessions.rs only); lane Codex review running; ported as opt/cand11 |
-| opt/cand10 | the 0.91 s main plus the opt/parse4 tokenizer and the opt/fields2 person build | deae350; gates pass (68 tests, 36/36, dev MATCH, 6/6); pinned bench median 1669 ms against 1680 ms for the 0.91 s build, faster in 8 of 15 rounds; fast-mode rounds about equal at 10M events; 60M output identical, time to the end of the last phase 2.926 s against 4.712 s, person build 0.713 s against 2.595 s; Codex review: no output defect, one memory note (the link pairs stay alive after the person build, about 40 MiB at 60M, while the measured 60M peak stays below main's: 8.17 GiB against 8.29 GiB) and two limits outside the final's scale; ready for the next submission slot |
+| opt/cand10 | the 0.91 s main plus the opt/parse4 tokenizer and the opt/fields2 person build | deae350; gates pass (68 tests, 36/36, dev MATCH, 6/6); pinned bench median 1669 ms against 1680 ms for the 0.91 s build, faster in 8 of 15 rounds; fast-mode rounds about equal at 10M events; 60M output identical, time to the end of the last phase 2.926 s against 4.712 s, person build 0.713 s against 2.595 s; Codex review: no output defect, one memory note (the link pairs stay alive after the person build, about 40 MiB at 60M, while the measured 60M peak stays below main's: 8.17 GiB against 8.29 GiB) and two limits outside the final's scale; scored 0.90 s (receipt BB-0BEA6B7B); merged into main |
 | opt/cand11 | the 0.91 s main plus the opt/sessions4 change (same patch) | ba252b8; gates pass (57 tests, 36/36, dev MATCH, 6/6); sessions and output 324 to 254 ms (lower in 14 of 16 rounds); pinned bench median 1427 ms against 1547 ms for the 0.91 s build, faster in 11 of 15 rounds; file creates and renames unchanged; 60M output identical, sessions and output 0.547 s against 0.591 s, clicks 0.287 s against 0.270 s; Codex review of the same patch running |
 | opt/dedup3 | CPU work of the events dedup phase (0.570 s of a 2.926 s run at 60M events) on the 0.91 s main, user and kernel time measured apart | lane building |
 | opt/cand12 | opt/cand10 plus the opt/sessions4 change (same patch) | ba56144; gates pass (69 tests, 36/36, dev MATCH, 6/6); sessions and output 217 to 139 ms (lower in 12 of 16 rounds); pinned bench median 1644 ms against 1520 ms for the 0.91 s build, faster in 4 of 15 rounds: fails the bench rule, not submitted; 60M output identical, but that run was slow in the events phase (5.054 s against 1.892 s), which cand12 shares with cand10 (1.537 s in its own 60M run) |
