@@ -38,6 +38,10 @@ where
     I: Fn() -> S + Sync,
     W: Fn(&mut S, &[u8], usize, usize) + Sync,
 {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(states) = crate::direct::try_cold(&crate::direct::Linux, paths, threads, chunk, crate::direct::BUFFER, &init, &work) {
+        return Ok(states);
+    }
     let clock = std::time::Instant::now();
     let mut maps = Vec::with_capacity(paths.len());
     for path in paths {
@@ -319,6 +323,7 @@ fn fields<'a, const N: usize, S>(data: &'a [u8], start: usize, end: usize, state
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::mem::MaybeUninit;
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("scan-{name}-{}", std::process::id()));
@@ -404,6 +409,23 @@ mod tests {
         rows
     }
 
+    fn push_fields<const N: usize>(rows: &mut Rows, data: &[u8], start: usize, end: usize) {
+        fields::<N, Rows>(data, start, end, rows, &|rows: &mut Rows, f: &[&[u8]; N]| rows.push(f.iter().map(|v| v.to_vec()).collect()));
+    }
+
+    fn pieced<const N: usize>(text: &[u8], piece: usize) -> Rows {
+        let mut rows = Rows::new();
+        let mut edges = Vec::new();
+        for data in text.chunks(piece) {
+            let (edge, body) = crate::direct::cut(data);
+            push_fields::<N>(&mut rows, data, 0, body);
+            edges.push(edge);
+        }
+        crate::direct::seams(&edges, |seam| push_fields::<N>(&mut rows, seam, 1, seam.len()));
+        rows.sort();
+        rows
+    }
+
     fn show(row: Option<&Vec<Vec<u8>>>) -> Option<Vec<String>> {
         row.map(|r| r.iter().map(|v| String::from_utf8_lossy(v).into_owned()).collect())
     }
@@ -418,6 +440,12 @@ mod tests {
                 let row = got.iter().zip(&want).position(|(g, w)| g != w).unwrap_or(got.len().min(want.len()));
                 panic!("N {N} chunk {chunk} {label}: {} rows, want {}; row {row} is {:?}, want {:?}", got.len(), want.len(), show(got.get(row)), show(want.get(row)));
             }
+        }
+        let mut sorted = want.clone();
+        sorted.sort();
+        for piece in [1, 2, 3, 7, 63, 64, 65, 127, 128, 129, 4095, 4096, 4097, usize::MAX] {
+            let got = pieced::<N>(text, piece);
+            assert!(got == sorted, "N {N} piece {piece} {label}: {} rows, want {}", got.len(), sorted.len());
         }
     }
 
@@ -655,5 +683,151 @@ mod tests {
             check_fields::<4>(&dir, seed);
             check_fields::<7>(&dir, seed);
         }
+    }
+
+    #[test]
+    fn pieces_of_small_and_unaligned_files_give_every_line_once() {
+        let mut rng = Rng(5);
+        let mut long = b"header\n".to_vec();
+        while long.len() < 3 * 4096 + 100 {
+            long.extend_from_slice(&random_line(&mut rng, 4));
+            long.push(b'\n');
+        }
+        let mut texts: Vec<Vec<u8>> = [b"".as_slice(), b"h", b"h\n", b"h\nx", b"h\n\n", b"\n", b"\n\n", b"h\n,\n\"\"\n"].iter().map(|t| t.to_vec()).collect();
+        for size in [1, 2, 100, 4095, 4096, 4097, 8191, 8192, 8193, 3 * 4096 + 17] {
+            texts.push(long[..size].to_vec());
+        }
+        for text in &texts {
+            let label = format!("a file of {} bytes", text.len());
+            agree::<1>(text, &label);
+            agree::<2>(text, &label);
+            agree::<4>(text, &label);
+            agree::<7>(text, &label);
+        }
+    }
+
+    struct Fake {
+        warm: Vec<PathBuf>,
+        step: usize,
+        fail_at: Option<u64>,
+        end_at: Option<u64>,
+        refuse_open: bool,
+    }
+
+    impl Fake {
+        fn cold(step: usize) -> Fake {
+            Fake { warm: Vec::new(), step, fail_at: None, end_at: None, refuse_open: false }
+        }
+    }
+
+    unsafe impl crate::direct::Disk for Fake {
+        type File = Vec<u8>;
+
+        fn incore(&self, path: &Path, _: &[u8], pages: &mut [u8]) -> io::Result<()> {
+            pages.fill(u8::from(self.warm.iter().any(|warm| warm == path)));
+            Ok(())
+        }
+
+        fn open(&self, path: &Path) -> io::Result<Vec<u8>> {
+            if self.refuse_open {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "direct reads refused"));
+            }
+            std::fs::read(path)
+        }
+
+        fn read_at(&self, file: &Vec<u8>, dst: &mut [MaybeUninit<u8>], offset: u64) -> io::Result<usize> {
+            let align = crate::direct::ALIGN;
+            if dst.as_ptr() as usize % align != 0 || dst.len() % align != 0 || offset % align as u64 != 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unaligned read of {} bytes at offset {offset}", dst.len())));
+            }
+            if self.fail_at == Some(offset) {
+                return Err(io::Error::other(format!("no read at offset {offset}")));
+            }
+            let end = self.end_at.map_or(file.len(), |end| file.len().min(end as usize));
+            let start = end.min(offset as usize);
+            let n = dst.len().min(self.step).min(end - start);
+            for (slot, &byte) in dst.iter_mut().zip(&file[start..start + n]) {
+                slot.write(byte);
+            }
+            Ok(n)
+        }
+    }
+
+    fn cold_files(dir: &Path) -> Vec<PathBuf> {
+        let mut rng = Rng(23);
+        let mut text = b"click_id,user_id,campaign_id,ts\n".to_vec();
+        while text.len() < 40_000 {
+            text.extend_from_slice(&random_line(&mut rng, 4));
+            text.push(b'\n');
+        }
+        let sizes = [0, 1, 700, 4095, 4096, 4097, 3 * 4096 + 17, text.len()];
+        for (i, size) in sizes.into_iter().enumerate() {
+            std::fs::write(dir.join(format!("part-{i}.csv")), &text[..size]).unwrap();
+        }
+        let long = [b"h\n".as_slice(), &[b'x'; 30_000], b",y,z,w\nq,w,e,r\n\"a\",b,c,d"].concat();
+        std::fs::write(dir.join("part-long.csv"), long).unwrap();
+        csv_files(dir).unwrap()
+    }
+
+    fn rows_of(states: Vec<Rows>) -> Rows {
+        let mut rows: Rows = states.into_iter().flatten().collect();
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn cold_reads_give_the_rows_the_maps_give() {
+        let dir = temp_dir("cold");
+        let paths = cold_files(&dir);
+        let want = rows_of(run_fields::<4, _, _, _>(&paths, 2, 100, Vec::new, |s: &mut Rows, f| s.push(f.iter().map(|v| v.to_vec()).collect())).unwrap());
+        let mut each: Rows = paths.iter().flat_map(|path| expected::<4>(&std::fs::read(path).unwrap())).collect();
+        each.sort();
+        assert!(want == each && want.len() > 100, "{} rows from the maps, {} from the dialect", want.len(), each.len());
+        assert!(want.iter().any(|row| row[0].len() == 30_000));
+        let every_other: Vec<PathBuf> = paths.iter().step_by(2).cloned().collect();
+        for buffer in [4096, 8192, 3 * 4096] {
+            for step in [4096, 8192, usize::MAX] {
+                for threads in [1, 3] {
+                    for warm in [Vec::new(), every_other.clone()] {
+                        let label = format!("buffer {buffer}, step {step}, threads {threads}, {} warm", warm.len());
+                        let fake = Fake { warm, ..Fake::cold(step) };
+                        let states = crate::direct::try_cold(&fake, &paths, threads, 100, buffer, &Vec::new, &push_fields::<4>).unwrap_or_else(|| panic!("{label}: no cold read"));
+                        assert_eq!(states.len(), threads, "{label}");
+                        let got = rows_of(states);
+                        assert!(got == want, "{label}: {} rows, want {}", got.len(), want.len());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cold_reads_refuse_every_failure() {
+        let dir = temp_dir("refuse");
+        let paths = cold_files(&dir);
+        let cases = [
+            ("every file warm", Fake { warm: paths.clone(), ..Fake::cold(usize::MAX) }),
+            ("a read error", Fake { fail_at: Some(4096), ..Fake::cold(usize::MAX) }),
+            ("a file shorter than its size", Fake { end_at: Some(4096), ..Fake::cold(usize::MAX) }),
+            ("an unaligned short read", Fake::cold(1000)),
+            ("an open refused", Fake { refuse_open: true, ..Fake::cold(usize::MAX) }),
+        ];
+        for (label, fake) in &cases {
+            assert!(crate::direct::try_cold(fake, &paths, 2, 100, 4096, &Vec::new, &push_fields::<4>).is_none(), "{label}");
+        }
+        assert!(crate::direct::try_cold(&Fake::cold(usize::MAX), &paths, 2, 100, 4095, &Vec::new, &push_fields::<4>).is_none(), "a read size off the alignment");
+        assert!(crate::direct::try_cold(&Fake::cold(usize::MAX), &paths, 2, 100, 4096, &Vec::new, &push_fields::<4>).is_some(), "no failure");
+    }
+
+    #[test]
+    fn cold_reads_refuse_edges_past_their_budget() {
+        let dir = temp_dir("budget");
+        std::fs::write(dir.join("part-wide.csv"), [b"h\n".as_slice(), &[b'x'; 100_000], b",y,z,w\n"].concat()).unwrap();
+        let paths = cold_files(&dir);
+        let want = rows_of(run_fields::<4, _, _, _>(&paths, 2, 100, Vec::new, |s: &mut Rows, f| s.push(f.iter().map(|v| v.to_vec()).collect())).unwrap());
+        assert!(want.iter().any(|row| row[0].len() == 100_000));
+        assert!(crate::direct::try_cold(&Fake::cold(usize::MAX), &paths, 2, 100, 4096, &Vec::new, &push_fields::<4>).is_none(), "4096-byte reads");
+        let states = crate::direct::try_cold(&Fake::cold(usize::MAX), &paths, 2, 100, 8 * 4096, &Vec::new, &push_fields::<4>).expect("32768-byte reads");
+        assert!(rows_of(states) == want);
     }
 }
