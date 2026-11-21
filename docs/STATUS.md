@@ -1,11 +1,11 @@
 # Status
 
-Updated 2026-11-21 13:53 UTC.
+Updated 2026-11-21 14:02 UTC.
 
 | Item | Value |
 |---|---|
 | Best practice score | 0.85 s (commit 8981d63, faster sessions phase and earlier release of the link pairs; entered in the final) |
-| Final-scale check | a67654b on 60M generated events: exit 0, peak working set 8.41 GiB, both tables identical to the 0.96 s build's output |
+| Final-scale check | 8981d63 on 60M generated events: exit 0, peak working set 8.43 GiB, both tables identical to the 0.90 s build's output; Codex audit of main 8610b13 against the final's limits: no wrong-table defect for generator-shaped data, nothing to fix |
 | Board leader | 0.31 s |
 | Target (leader minus 10 percent) | 0.279 s |
 | Main | solver code of 8981d63 (parse stage redesign, the sessions and output rewrite, the faster dedup and click filing, the faster event decoding and filing, the block tokenizer, the person table built in parts and the faster sessions phase, no code comments); the opt/memexit changes are not in it, since they scored the same 1.04 s |
