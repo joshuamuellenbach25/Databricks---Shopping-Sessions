@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 06:12 UTC.
+Updated 2026-11-21 06:22 UTC.
 
 | Item | Value |
 |---|---|
@@ -13,10 +13,11 @@ Updated 2026-11-21 06:12 UTC.
 
 | Branch | Change | State |
 |---|---|---|
-| opt/parse2 | event parse stage redesign (53 percent of runtime) | building |
+| opt/parse2 | event parse stage redesign (53 percent of runtime) | gates pass (d838fc9); events phase 12 percent faster natively; no whole-run win in a pinned bench yet |
+| opt/directio | Linux input reads that skip the page cache when the data is not resident, overlapped with parsing | building |
 | opt/sessions2 | sessions and output rewrite (25 percent of runtime) | building, gates running |
 | opt/people2 | linked-ID build rewrite (29 percent, runs beside parsing) | building |
-| opt/nocomments | remove code comments from the shipped files with a parser | building |
+| opt/nocomments | remove code comments from the shipped files with a parser | committed (159eaa3); Codex review running |
 | opt/parse-fix | inline timestamp parsing, word-at-a-time prices, review fix | gates pass; slower than the best scored code in a pinned 9-round bench (median 1123 ms against 1078 ms); not submitted |
 | opt/cand1 | main plus opt/writer and opt/dedupbuf | slower than the best scored code in a pinned 7-round bench (median 1420 ms against 1094 ms); not submitted |
 | opt/coldread, opt/prefault | Linux read and pre-fault changes | no measured gain; parked |
