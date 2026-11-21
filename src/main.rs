@@ -11,15 +11,16 @@ mod sessions;
 mod timestamp;
 
 use std::ffi::{c_int, c_long};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Mutex};
 use std::time::Instant;
 
 use clicks::Click;
 use events::Event;
-use lookups::Products;
+use lookups::{Campaigns, Products};
 use output::{Parts, UserDaily};
 use people::People;
 use sessions::{Accum, Counts, Rules, Scratch, UserRows};
@@ -80,12 +81,12 @@ fn run() -> Result<(), Fail> {
     let window = lookups::read_manifest(&data)?;
     let products: &'static Products = Box::leak(Box::new(lookups::read_products(&data)?));
     events::check_fits(window, products)?;
-    let campaigns = lookups::read_campaigns(&data)?;
+    let campaigns: &'static Campaigns = Box::leak(Box::new(lookups::read_campaigns(&data)?));
     let user_dir = out.join("user_daily");
     let campaign_dir = out.join("campaign_daily");
     std::fs::create_dir_all(&user_dir)?;
     std::fs::create_dir_all(&campaign_dir)?;
-    let (user_parts, campaign_parts) = (Parts::new(user_dir), Parts::new(campaign_dir));
+    let (user_parts, campaign_parts) = (Parts::new(user_dir)?, Parts::new(campaign_dir)?);
     let link_pairs = links::collect(&scan::csv_files(&data.join("links"))?, threads)?;
     let event_files = scan::csv_files(&data.join("events"))?;
     let click_files = scan::csv_files(&data.join("clicks"))?;
@@ -112,7 +113,7 @@ fn run() -> Result<(), Fail> {
     eprintln!("surviving events: {surviving}");
     phase("events dedup");
 
-    let click_ctx = clicks::Context { window, campaigns: &campaigns, people: &people };
+    let click_ctx = clicks::Context { window, campaigns, people: &people };
     let click_buckets = clicks::collect(&click_files, threads, &click_ctx)?;
     eprintln!("valid clicks: {}", count(&click_buckets));
     phase("clicks");
@@ -128,13 +129,14 @@ fn run() -> Result<(), Fail> {
         .map(|parts| Mutex::new(Some((parts, click_buckets.next().unwrap_or_default()))))
         .collect();
     let next = AtomicUsize::new(0);
-    let finished = std::thread::scope(|scope| -> Result<(Arc<Accum>, f64, f64, f64), String> {
+    let (sender, arrivals) = mpsc::channel::<Counts>();
+    let finished = std::thread::scope(|scope| -> Result<(Accum, f64, f64, f64), String> {
         let handles: Vec<_> = (0..threads)
             .map(|thread| {
-                let (buckets, order, next, rules, campaigns, user_parts) = (&buckets, &order, &next, &rules, &campaigns, &user_parts);
-                scope.spawn(move || -> Result<(Counts, bool, f64, f64, f64), String> {
+                let (buckets, order, next, rules, user_parts, sender) = (&buckets, &order, &next, &rules, &user_parts, sender.clone());
+                scope.spawn(move || -> Result<(bool, f64, f64, f64), String> {
                     let started = Instant::now();
-                    let fail = |e: Fail| format!("{}: {e}", user_parts.staging(thread).display());
+                    let fail = |e: Fail| format!("{}: {e}", user_parts.path(thread).display());
                     let mut counts = Counts::new(campaigns.ids.len(), days);
                     let mut scratch = Scratch::new(campaigns.ids.len(), days);
                     let mut rows = UserRows::with_capacity(2 * ROW_GROUP_ROWS);
@@ -167,6 +169,8 @@ fn run() -> Result<(), Fail> {
                             flush(&mut rows, &mut file)?;
                         }
                     }
+                    sender.send(counts).map_err(|_| format!("sessions thread {thread}: the campaign totals were no longer being collected"))?;
+                    drop(sender);
                     if !rows.is_empty() {
                         flush(&mut rows, &mut file)?;
                     }
@@ -176,47 +180,55 @@ fn run() -> Result<(), Fail> {
                         file.close().map_err(fail)?;
                         written += begun.elapsed().as_secs_f64();
                     }
-                    Ok((counts, wrote, started.elapsed().as_secs_f64() - written, written, scratch.sort_seconds))
+                    Ok((wrote, started.elapsed().as_secs_f64() - written, written, scratch.sort_seconds))
                 })
             })
             .collect();
+        drop(sender);
+        let shares = threads.min(campaigns.ids.len());
+        let campaign_files: Vec<Result<File, String>> = (0..shares).map(|part| campaign_parts.create(part)).collect();
         let mut total = Accum::new(campaigns.ids.len(), days);
-        let mut user_written = Vec::new();
-        let (mut compute_max, mut write_max, mut sort_max) = (0f64, 0f64, 0f64);
-        for (thread, handle) in handles.into_iter().enumerate() {
-            let (counts, wrote, computed, written, sorted) = handle.join().unwrap()?;
+        let mut merged = 0;
+        for counts in &arrivals {
             total.merge(&counts);
-            if wrote {
-                user_written.push(thread);
-            }
+            merged += 1;
+        }
+        let campaign_rows: Result<Vec<usize>, String> = if merged == threads {
+            std::thread::scope(|inner| {
+                let (total, campaign_parts) = (&total, &campaign_parts);
+                let writers: Vec<_> = campaign_files
+                    .into_iter()
+                    .enumerate()
+                    .map(|(part, file)| {
+                        let share = part * campaigns.ids.len() / shares..(part + 1) * campaigns.ids.len() / shares;
+                        inner.spawn(move || output::write_campaign_daily(file?, total, campaigns, share, base_day).map_err(|e| format!("{}: {e}", campaign_parts.path(part).display())))
+                    })
+                    .collect();
+                writers.into_iter().map(|writer| writer.join().unwrap()).collect()
+            })
+        } else {
+            Err(format!("{merged} of {threads} sessions threads delivered campaign totals"))
+        };
+        let mut any_user_part = false;
+        let (mut compute_max, mut write_max, mut sort_max) = (0f64, 0f64, 0f64);
+        for handle in handles {
+            let (wrote, computed, written, sorted) = handle.join().unwrap()?;
+            any_user_part |= wrote;
             compute_max = compute_max.max(computed);
             write_max = write_max.max(written);
             sort_max = sort_max.max(sorted);
         }
-        let total = Arc::new(total);
-        let writers: Vec<_> = (0..threads)
-            .map(|part| {
-                let (total, campaigns, campaign_parts) = (Arc::clone(&total), &campaigns, &campaign_parts);
-                let share = part * campaigns.ids.len() / threads..(part + 1) * campaigns.ids.len() / threads;
-                scope.spawn(move || output::write_campaign_daily(campaign_parts, part, &total, campaigns, share, base_day, false))
-            })
-            .collect();
-        let mut campaign_written = Vec::new();
-        for (part, writer) in writers.into_iter().enumerate() {
-            if writer.join().unwrap()? {
-                campaign_written.push(part);
+        let campaign_rows = campaign_rows?;
+        let any_campaign_rows = campaign_rows.iter().any(|&rows| rows > 0);
+        for (part, &rows) in campaign_rows.iter().enumerate() {
+            if rows == 0 && (any_campaign_rows || part > 0) {
+                campaign_parts.remove(part)?;
             }
         }
-        if user_written.is_empty() {
-            UserDaily::create(user_parts.create(0)?, &products.categories).and_then(UserDaily::close).map_err(|e| format!("{}: {e}", user_parts.staging(0).display()))?;
-            user_written.push(0);
+        if !any_user_part {
+            UserDaily::create(user_parts.create(0)?, &products.categories).and_then(UserDaily::close).map_err(|e| format!("{}: {e}", user_parts.path(0).display()))?;
         }
-        if campaign_written.is_empty() {
-            output::write_campaign_daily(&campaign_parts, 0, &total, &campaigns, 0..0, base_day, true)?;
-            campaign_written.push(0);
-        }
-        user_parts.publish(&user_written)?;
-        campaign_parts.publish(&campaign_written)?;
+        output::publish(&[&user_parts, &campaign_parts])?;
         Ok((total, compute_max, write_max, sort_max))
     });
     let (total, compute_max, write_max, sort_max) = match finished {
