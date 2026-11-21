@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 14:13 UTC.
+Updated 2026-11-21 14:21 UTC.
 
 | Item | Value |
 |---|---|
@@ -37,7 +37,7 @@ Updated 2026-11-21 14:13 UTC.
 | opt/cand10 | the 0.91 s main plus the opt/parse4 tokenizer and the opt/fields2 person build | deae350; gates pass (68 tests, 36/36, dev MATCH, 6/6); pinned bench median 1669 ms against 1680 ms for the 0.91 s build, faster in 8 of 15 rounds; fast-mode rounds about equal at 10M events; 60M output identical, time to the end of the last phase 2.926 s against 4.712 s, person build 0.713 s against 2.595 s; Codex review: no output defect, one memory note (the link pairs stay alive after the person build, about 40 MiB at 60M, while the measured 60M peak stays below main's: 8.17 GiB against 8.29 GiB) and two limits outside the final's scale; scored 0.90 s (receipt BB-0BEA6B7B); merged into main |
 | opt/cand11 | the 0.91 s main plus the opt/sessions4 change (same patch) | ba252b8; gates pass (57 tests, 36/36, dev MATCH, 6/6); sessions and output 324 to 254 ms (lower in 14 of 16 rounds); pinned bench median 1427 ms against 1547 ms for the 0.91 s build, faster in 11 of 15 rounds; file creates and renames unchanged; 60M output identical, sessions and output 0.547 s against 0.591 s, clicks 0.287 s against 0.270 s; Codex review of the same patch running |
 | opt/dedup3 | CPU work of the events dedup phase (0.570 s of a 2.926 s run at 60M events) on the 0.91 s main, user and kernel time measured apart | 7c4b1fc (events.rs, people.rs); lane proof running; ported as opt/cand14 |
-| opt/cand14 | the 0.85 s main plus the opt/dedup3 change (same patch) | aa7e95f did not compile on the new main (a call to filter_bits as a method); fix 20d9ddd (one line); Codex review: no output defect, the fix re-checked clean; gates, phase proof and bench against the 0.85 s build queued behind the bench lock |
+| opt/cand14 | the 0.85 s main plus the opt/dedup3 change (same patch) | aa7e95f did not compile on the new main (a call to filter_bits as a method); fix 20d9ddd (one line); Codex review: no output defect, the fix re-checked clean; gates pass (69 tests, 36/36, dev MATCH, 6/6); pinned bench median 1461 ms against 1433 ms for the 0.85 s build, faster in 8 of 15 rounds: fails the bench rule (higher median), not submitted |
 | opt/scan3 | user CPU of the events scan (0.629 s of a 1.152 s fast run at 20M events) on the 0.85 s main, user and kernel time measured apart | lane building |
 | opt/tests1 | the opt/sessions4 credit-tie test fix plus a smallest-first tie, tests only, on the 0.85 s main | lane building |
 | opt/cand12 | opt/cand10 plus the opt/sessions4 change (same patch) | ba56144; gates pass (69 tests, 36/36, dev MATCH, 6/6); sessions and output 217 to 139 ms (lower in 12 of 16 rounds); pinned bench median 1644 ms against 1520 ms for the 0.91 s build, faster in 4 of 15 rounds: fails the bench rule, not submitted; 60M output identical, but that run was slow in the events phase (5.054 s against 1.892 s), which cand12 shares with cand10 (1.537 s in its own 60M run) |
