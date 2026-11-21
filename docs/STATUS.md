@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 06:32 UTC.
+Updated 2026-11-21 06:46 UTC.
 
 | Item | Value |
 |---|---|
@@ -13,7 +13,8 @@ Updated 2026-11-21 06:32 UTC.
 
 | Branch | Change | State |
 |---|---|---|
-| opt/parse2 | event parse stage redesign (53 percent of runtime) | gates pass (d838fc9); events phase 12 percent faster natively; no whole-run win in a pinned bench yet |
+| opt/parse2 | event parse stage redesign (53 percent of runtime), comments stripped | gates pass (79a758b); pinned bench median 1049 ms against 1121 ms for the best scored code; submitted, being scored |
+| opt/people2 | linked-ID build in parts on several threads | first commit b88353f; gates and Codex review in progress |
 | opt/directio | Linux input reads that skip the page cache when the data is not resident, overlapped with parsing | building |
 | opt/sessions2 | sessions and output rewrite (25 percent of runtime) | building, gates running |
 | opt/people2 | linked-ID build rewrite (29 percent, runs beside parsing) | building |
