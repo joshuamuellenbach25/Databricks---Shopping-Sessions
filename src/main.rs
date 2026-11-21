@@ -95,8 +95,8 @@ fn run() -> Result<(), Fail> {
     let (people, parsed) = std::thread::scope(|scope| {
         let builder = scope.spawn(|| {
             let started = Instant::now();
-            let expected = link_pairs.iter().map(Vec::len).sum();
-            let people = People::build(link_pairs.into_iter().flatten(), expected);
+            let expected: usize = link_pairs.iter().map(Vec::len).sum();
+            let people = People::build_in_parts(&link_pairs, 1);
             eprintln!("  people: {expected} links in {:.3} s", started.elapsed().as_secs_f64());
             people
         });

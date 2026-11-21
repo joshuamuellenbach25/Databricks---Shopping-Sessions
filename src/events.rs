@@ -317,7 +317,7 @@ fn stream(bucket: &mut Vec<Raw>, waiting: &[Raw; WAITING]) {
 pub fn parse(paths: &[PathBuf], threads: usize, ctx: &Context) -> std::io::Result<Parsed> {
     let bytes = crate::scan::total_size(paths)? as usize;
     let per_bucket = bytes / 70 / threads / EVENT_BUCKETS + 16;
-    let states = crate::scan::run_fields::<7, _, _, _>(paths, threads, CHUNK, || Filer::new(per_bucket), |state, fields| {
+    let states = crate::scan::run_events(paths, threads, CHUNK, || Filer::new(per_bucket), |state, fields| {
         if let Some(raw) = parse_event(fields, ctx) {
             state.file(raw);
         }
