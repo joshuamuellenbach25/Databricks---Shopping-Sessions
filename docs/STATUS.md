@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 07:33 UTC.
+Updated 2026-11-21 07:42 UTC.
 
 | Item | Value |
 |---|---|
@@ -20,7 +20,7 @@ Updated 2026-11-21 07:33 UTC.
 | opt/memexit | release memory and input mappings early to cut page zeroing and exit teardown (about 0.4 s of each local run falls after the last timed phase) | building |
 | opt/directio | Linux input reads that skip the page cache when the data is not resident, overlapped with parsing | 480b924 on the old main; fixing the confirmed Codex findings; needs a Linux bench |
 | opt/sessions2 | sessions and output rewrite (25 percent of runtime) | a90c101 on opt/cand1; sessions and output 0.174 s to 0.097 s, lower in 16 of 16 rounds; gates pass; Codex review running |
-| opt/cand3 | main plus only the opt/sessions2 change, comments stripped | port, gates, Codex review and pinned bench running |
+| opt/cand3 | main plus only the opt/sessions2 change, comments stripped | 0890fe7; tests 48 passed, 36/36 fixtures, 6/6 seeds; Codex review and pinned bench running |
 | opt/nocomments | remove code comments from the shipped files with a parser | superseded: the parse2 merge removed every comment from main (parser check: 0 left) |
 | opt/parse-fix | inline timestamp parsing, word-at-a-time prices, review fix | gates pass; slower than the best scored code in a pinned 9-round bench (median 1123 ms against 1078 ms); not submitted |
 | opt/cand1 | main plus opt/writer and opt/dedupbuf | slower than the best scored code in a pinned 7-round bench (median 1420 ms against 1094 ms); not submitted |
