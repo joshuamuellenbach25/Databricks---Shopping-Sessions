@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-21 09:00 UTC.
+Updated 2026-11-21 09:02 UTC.
 
 | Item | Value |
 |---|---|
@@ -21,6 +21,7 @@ Updated 2026-11-21 09:00 UTC.
 | opt/directio | Linux input reads that skip the page cache when the data is not resident, overlapped with parsing | ee748b6 on the old main; gates pass on Windows (44 tests, 36/36, dev MATCH, 6/6), where only the fallback path runs; Codex re-check left 2 test-only items; the Linux code has not been compiled yet (no Linux target or Docker here) |
 | opt/sessions2 | sessions and output rewrite (25 percent of runtime) | a90c101 on opt/cand1; sessions and output 0.174 s to 0.097 s, lower in 16 of 16 rounds; gates pass; Codex confirmed 3 items (stale parts when an output folder is reused with fewer threads, empty parts left by a failed run, added comments); fix 9e9c9f3 stages output parts and publishes them after a whole run; Codex re-check running |
 | opt/parse3 | events parse throughput on the current main (45 percent of runtime, about 0.37 GB/s per thread now) | building |
+| opt/dedup2 | events dedup and clicks on the current main (24 percent of runtime) | building |
 | opt/cand4 | main plus the opt/directio change, comments stripped | e407c88; gates and Codex review running; Linux code not compiled here |
 | opt/cand3 | main plus only the opt/sessions2 change, comments stripped | 0890fe7; gates pass (48 tests, 36/36, dev MATCH, 6/6); reference matched in 228 of 228 runs; Codex confirmed 5 items, none in a single fresh run (reused output folder, failed rerun, per-worker category copy, open file handles, a 2^31 event limit); fix 8643225 (output published only after a whole run, writer text no longer leaked); bench median 1738 ms against 1914 ms, 16 of 25 rounds; submitted (receipt BB-FEAC4A51), being scored |
 | opt/nocomments | remove code comments from the shipped files with a parser | superseded: the parse2 merge removed every comment from main (parser check: 0 left) |
