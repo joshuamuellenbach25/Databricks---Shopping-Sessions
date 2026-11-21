@@ -1,13 +1,13 @@
 # Status
 
-Updated 2026-11-21 10:24 UTC.
+Updated 2026-11-21 10:26 UTC.
 
 | Item | Value |
 |---|---|
-| Best practice score | 0.96 s (commit 8643225, sessions and output rewrite; entered in the final) |
+| Best practice score | 0.92 s (commit a67654b, faster event dedup and click filing; entered in the final) |
 | Board leader | 0.36 s |
 | Target (leader minus 10 percent) | 0.324 s |
-| Main | solver code of 8643225 (parse stage redesign plus the sessions and output rewrite, no code comments); the opt/memexit changes are not in it, since they scored the same 1.04 s |
+| Main | solver code of a67654b (parse stage redesign, the sessions and output rewrite and the faster dedup and click filing, no code comments); the opt/memexit changes are not in it, since they scored the same 1.04 s |
 
 ## Work in progress
 
@@ -24,7 +24,7 @@ Updated 2026-11-21 10:24 UTC.
 | opt/parse3 | events parse throughput (block size of the record flush) | cc8936e; gates pass; about 2 percent faster in fast-mode rounds, under the 5 percent floor; stopped |
 | opt/parse4 | events-only tokenizer and a cheaper first touch of input pages, on the 0.96 s main | 9f8aaa5 committed (event lines tokenized in 64-byte blocks); phase proof and bench running; Codex review next |
 | opt/dedup2 | events dedup and clicks (24 percent of runtime), on the 1.04 s solver code | a05b4db; gates pass (46 tests, 36/36, dev MATCH, 6/6); against the 1.04 s build: dedup 118 to 64 ms and clicks 61 to 54 ms (lower in 12 of 16 rounds each), bench median 1133 ms against 1272 ms, 10 of 15 rounds; Codex review running; ported as opt/cand6 |
-| opt/cand6 | the 0.96 s main plus the opt/dedup2 change (same patch) | a67654b; gates pass (54 tests, 36/36, dev MATCH, 6/6); Codex review: no output defect, 2 resource limits outside the final's scale (not counted); against the 0.96 s build in the 4 fast-mode rounds of 16: dedup 108 to 55.5 ms, total 662.5 to 604.5 ms; pinned bench median 1174 ms against 1826 ms, faster in 10 of 15 rounds; submitted 10:23 UTC (receipt BB-E8BAC516), scoring |
+| opt/cand6 | the 0.96 s main plus the opt/dedup2 change (same patch) | a67654b; gates pass (54 tests, 36/36, dev MATCH, 6/6); Codex review: no output defect, 2 resource limits outside the final's scale (not counted); against the 0.96 s build in the 4 fast-mode rounds of 16: dedup 108 to 55.5 ms, total 662.5 to 604.5 ms; pinned bench median 1174 ms against 1826 ms, faster in 10 of 15 rounds; scored 0.92 s (receipt BB-E8BAC516); merged into main |
 | opt/sessions3 | sessions and output on the 0.96 s main (about 21 percent of runtime) | building |
 | opt/cand4 | the 1.04 s main plus the opt/directio change, comments stripped | 51d0233; gates pass on Windows (55 tests, 36/36, dev MATCH, 6/6); Codex confirmed 1 item (overlay mounts refuse the read probe; fixed: unknown residency now reads directly), 0 left; the Linux code is not compiled here; needs a port onto the 0.96 s main |
 | opt/cand3 | main plus only the opt/sessions2 change, comments stripped | 0890fe7; gates pass (48 tests, 36/36, dev MATCH, 6/6); reference matched in 228 of 228 runs; Codex confirmed 5 items, none in a single fresh run (reused output folder, failed rerun, per-worker category copy, open file handles, a 2^31 event limit); fix 8643225 (output published only after a whole run, writer text no longer leaked); bench median 1738 ms against 1914 ms, 16 of 25 rounds; scored 0.96 s (receipt BB-FEAC4A51); merged into main |
